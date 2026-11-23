@@ -14,9 +14,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/catcatchcatast/dsh-antigravity-bridge.git"
+    "url": "git+https://github.com/NaghtSieger/dsh-antigravity-bridge.git"
   },
-  "homepage": "https://github.com/catcatchcatast/dsh-antigravity-bridge#readme",
+  "homepage": "https://github.com/NaghtSieger/dsh-antigravity-bridge#readme",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",

@@ -734,6 +734,48 @@ function isPureToolUpdateDeveloperMessage(message: RequestMessage): boolean {
 }
 
 /**
+ * Extract non-offloaded image blocks from messages into inline ACP/MCP image
+ * items while preserving all remaining non-image blocks for transcript rendering.
+ * Never throws on image-read failures; unreadable images fall back to a text marker.
+ */
+export async function extractMessageImages(
+  messages: readonly RequestMessage[],
+  resolveImage: ImageResolver,
+  canReadImages = true,
+): Promise<{ textMessages: RequestMessage[]; images: Array<{ type: 'image'; data: string; mimeType: string }> }> {
+  const images: Array<{ type: 'image'; data: string; mimeType: string }> = []
+  const textMessages: RequestMessage[] = []
+  for (const message of messages) {
+    if (message.role === 'user' || message.role === 'developer' || message.role === 'tool') {
+      const remaining: ContentBlock[] = []
+      for (const block of message.content) {
+        if (block.type === 'image' && block.offloaded !== true && canReadImages) {
+          let image: ResolvedImage | undefined
+          try {
+            image = await resolveImage(block)
+          } catch {
+            image = undefined
+          }
+          if (image !== undefined) {
+            images.push({ type: 'image', data: image.data, mimeType: image.mimeType })
+          } else {
+            remaining.push({ type: 'text', text: `[image ${block.attachment.attachmentId} unavailable]` })
+          }
+        } else {
+          remaining.push(block)
+        }
+      }
+      if (remaining.length > 0) {
+        textMessages.push({ ...message, content: remaining } as RequestMessage)
+      }
+    } else {
+      textMessages.push(message)
+    }
+  }
+  return { textMessages, images }
+}
+
+/**
  * Convert new input messages (user, developer notices) into live prompt blocks,
  * preserving the order supplied by DSH and separating
  * consecutive message groups with blank lines.
@@ -759,23 +801,13 @@ export async function inputPrompt(
       (message.role === 'developer' || message.role === 'tool')
       && message.content.some(b => b.type === 'image' && b.offloaded !== true)
     ) {
-      const remaining: ContentBlock[] = []
-      const resolvedImages: AcpPromptBlock[] = []
-      for (const block of message.content) {
-        if (block.type === 'image' && block.offloaded !== true) {
-          const image = await resolveImage(block)
-          if (image !== undefined) resolvedImages.push({ type: 'image', data: image.data, mimeType: image.mimeType })
-          else remaining.push({ type: 'text', text: `[image ${block.attachment.attachmentId} unavailable]` })
-        } else {
-          remaining.push(block)
-        }
-      }
+      const extracted = await extractMessageImages([message], resolveImage, true)
       group = []
-      if (remaining.length > 0) {
-        const text = renderTranscript([{ ...message, content: remaining } as RequestMessage])
+      if (extracted.textMessages.length > 0) {
+        const text = renderTranscript(extracted.textMessages)
         if (text.length > 0) group.push({ type: 'text', text })
       }
-      group.push(...resolvedImages)
+      group.push(...extracted.images)
     } else {
       const text = renderTranscript([message])
       group = text.length > 0 ? [{ type: 'text', text }] : []

@@ -208,8 +208,13 @@ export function apply(ctx: Context, config: Config): void {
     const store = attachments()
     if (store === undefined) return undefined
     const ref = block.attachment
-    const image = await store.readImageRequest(ref, { width: ref.width, height: ref.height, maxBytes: REQUEST_IMAGE_MAX_BYTES })
-    return { data: Buffer.from(image.data).toString('base64'), mimeType: image.mediaType }
+    try {
+      const image = await store.readImageRequest(ref, { width: ref.width, height: ref.height, maxBytes: REQUEST_IMAGE_MAX_BYTES })
+      return { data: Buffer.from(image.data).toString('base64'), mimeType: image.mediaType }
+    } catch (error) {
+      ctx.logger.warn(`antigravity-acp: failed to read image attachment ${ref.attachmentId}: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    }
   }
 
   const runtime = new AntigravityRuntime({

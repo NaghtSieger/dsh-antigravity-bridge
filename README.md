@@ -16,13 +16,13 @@
 在 DSH 的插件安装入口使用本仓库的 Git 地址：
 
 ```text
-git+https://github.com/catcatchcatast/dsh-antigravity-bridge.git
+git+https://github.com/NaghtSieger/dsh-antigravity-bridge.git
 ```
 
 使用 DSH CLI 时，将 `PROFILE_NAME` 替换为实际运行的配置名，例如桌面端通常是 `desktop`，Web 服务通常是 `web`。
 
 ```sh
-dsh plugin --profile PROFILE_NAME add "git+https://github.com/catcatchcatast/dsh-antigravity-bridge.git"
+dsh plugin --profile PROFILE_NAME add "git+https://github.com/NaghtSieger/dsh-antigravity-bridge.git"
 ```
 
 也可在本仓库根目录运行 `npm pack`，把生成的 tgz 安装到目标 DSH 配置。在插件管理中确认已启用，然后从模型选择器的 Antigravity 分组选择模型。

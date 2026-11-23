@@ -36,7 +36,7 @@ import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type Avai
 import { asDegradeAction, asEffort, asEngineMode, current, EFFORTS, type AccountProfile, type Config, type DegradeAction, type Effort, type EngineMode } from './config.ts'
 import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
 import {
-  BRIDGE_TEXT_BYTES, formatSafeBridgeGuidelines, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, MCP_SERVER_NAME, prepareNativeRequest, splitReplay,
+  BRIDGE_TEXT_BYTES, extractMessageImages, formatSafeBridgeGuidelines, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, MCP_SERVER_NAME, prepareNativeRequest, splitReplay,
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
   type AcpPromptBlock, type ImageResolver, type NativeSandboxMode, type NativeSessionContext,
 } from './history.ts'
@@ -1295,13 +1295,7 @@ export class AntigravityRuntime {
     const handoffBlocks = await this.handoff(conv, proc, blocks, plan.rebuild && plan.history.length > 0, options.signal, reservedBytes)
     const finalBlocks = guidelinesBlock !== undefined ? [guidelinesBlock, ...handoffBlocks] : [...handoffBlocks]
     conv.reportedToolCalls.clear()
-    const onCircuitBreak = this.circuitBreakerOn429()
-      ? (error: LlmError): void => {
-          this.host.log.warn(`antigravity-acp: circuit breaker tripped on ${conv.key}: ${error.message}`)
-          if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
-        }
-      : undefined
-    conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native', onCircuitBreak)
+    conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native', this.createCircuitBreaker(conv, proc))
     conv.health.beginTurn()
     // Record the request this prompt belongs to; a rebuild above (which
     // replaced the whole bookkeeping object) already cleared it.
@@ -1408,13 +1402,7 @@ export class AntigravityRuntime {
     const reservedBytes = guidelinesBlock !== undefined ? Buffer.byteLength(guidelinesBlock.text, 'utf8') : 0
     const handoffBlocks = await this.handoff(conv, proc, blocks, hasHistory, options.signal, reservedBytes)
     const finalBlocks = guidelinesBlock !== undefined ? [guidelinesBlock, ...handoffBlocks] : handoffBlocks
-    const onCircuitBreak = this.circuitBreakerOn429()
-      ? (error: LlmError): void => {
-          this.host.log.warn(`antigravity-acp: circuit breaker tripped during reanswer on ${conv.key}: ${error.message}`)
-          if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
-        }
-      : undefined
-    conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native', onCircuitBreak)
+    conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native', this.createCircuitBreaker(conv, proc, 'during reanswer'))
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
     this.startPrompt(conv, proc, finalBlocks)
@@ -2199,18 +2187,33 @@ export class AntigravityRuntime {
     conv.turn = undefined
   }
 
+  private createCircuitBreaker(
+    conv: Conversation,
+    proc: AcpProcess,
+    context?: string,
+  ): ((error: LlmError) => void) | undefined {
+    if (!this.circuitBreakerOn429()) return undefined
+    const where = context !== undefined ? ` ${context}` : ''
+    return (error: LlmError): void => {
+      this.host.log.warn(`antigravity-acp: circuit breaker tripped${where} on ${conv.key}: ${error.message}`)
+      if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
+    }
+  }
+
   private async deliverResults(conv: Conversation, slot: AccountSlot, messages: readonly RequestMessage[], proc: AcpProcess, tools: readonly BridgeTool[]): Promise<boolean> {
     const turn = conv.turn as AcpTurn
     const results = new Map<string, Extract<RequestMessage, { role: 'tool' }>>()
-    let last = -1
+    const matchedIndices = new Set<number>()
+    let first = messages.length
     messages.forEach((message, index) => {
       if (message.role === 'tool' && turn.pendingCalls.has(message.toolCallId)) {
         results.set(message.toolCallId, message)
-        last = Math.max(last, index)
+        matchedIndices.add(index)
+        first = Math.min(first, index)
       }
     })
     if (results.size !== turn.pendingCalls.size) return false
-    const extras = messages.slice(last + 1)
+    const extras = messages.slice(first).filter((_, offset) => !matchedIndices.has(first + offset))
     if (extras.some(m => m.role === 'assistant' || m.role === 'tool')) return false
     const nonPureExtras = extras.filter(
       m => !(m.role === 'developer' && m.content.length > 0 && m.content.every(b => b.type === 'tool-addition' || b.type === 'tool-removal')),
@@ -2223,7 +2226,7 @@ export class AntigravityRuntime {
     if (turn.finished || !this.isTurnLive(turn)) {
       const pendingResolved = await this.resolveMessageImages(pending.map(call => results.get(call.id) as RequestMessage))
       conv.reportedToolCalls.clear()
-      conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native')
+      conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native', this.createCircuitBreaker(conv, proc, 'during tool continuation'))
       if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
       const fallbackText = `${pendingResolved.text}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.`
       this.startPrompt(conv, proc, [
@@ -2254,34 +2257,10 @@ export class AntigravityRuntime {
     messages: readonly RequestMessage[],
   ): Promise<{ text: string; images: Array<{ type: 'image'; data: string; mimeType: string }> }> {
     if (messages.length === 0) return { text: '', images: [] }
-    const images: Array<{ type: 'image'; data: string; mimeType: string }> = []
-    const textMessages: RequestMessage[] = []
-    const canRead = this.host.canReadImages()
-    for (const message of messages) {
-      if (message.role === 'user' || message.role === 'developer' || message.role === 'tool') {
-        const remaining: ContentBlock[] = []
-        for (const block of message.content) {
-          if (block.type === 'image' && block.offloaded !== true && canRead) {
-            const image = await this.host.readImage(block)
-            if (image !== undefined) {
-              images.push({ type: 'image', data: image.data, mimeType: image.mimeType })
-            } else {
-              remaining.push({ type: 'text', text: `[image ${block.attachment.attachmentId} unavailable]` })
-            }
-          } else {
-            remaining.push(block)
-          }
-        }
-        if (remaining.length > 0) {
-          textMessages.push({ ...message, content: remaining } as RequestMessage)
-        }
-      } else {
-        textMessages.push(message)
-      }
-    }
+    const extracted = await extractMessageImages(messages, this.host.readImage, this.host.canReadImages())
     return {
-      text: textMessages.length > 0 ? renderTranscript(textMessages) : '',
-      images,
+      text: extracted.textMessages.length > 0 ? renderTranscript(extracted.textMessages) : '',
+      images: extracted.images,
     }
   }
 
@@ -2307,7 +2286,13 @@ export class AntigravityRuntime {
       if (block.type === 'text') {
         if (block.text.length > 0) items.push({ type: 'text', text: block.text })
       } else if (block.type === 'image' && block.offloaded !== true && this.host.canReadImages()) {
-        const image = await this.host.readImage(block)
+        let image: { data: string; mimeType: string } | undefined
+        try {
+          image = await this.host.readImage(block)
+        } catch (error) {
+          this.host.log.warn(`antigravity-acp: failed to read tool-result image ${block.attachment.attachmentId}: ${error instanceof Error ? error.message : String(error)}`)
+          image = undefined
+        }
         if (image !== undefined) items.push({ type: 'image', data: image.data, mimeType: image.mimeType })
         else items.push({ type: 'text', text: `[image ${block.attachment.attachmentId} unavailable]` })
       } else {
@@ -2489,7 +2474,14 @@ export class AntigravityRuntime {
     if (request.name === CALL_TOOL_NAME) {
       const rawTarget = typeof request.arguments.name === 'string' ? request.arguments.name.trim() : ''
       const targetName = stripAgentToolPrefix(rawTarget)
-      const rawArgs = request.arguments.arguments
+      let rawArgs: unknown = request.arguments.arguments
+      if (typeof rawArgs === 'string' && rawArgs.trim().startsWith('{')) {
+        try {
+          rawArgs = JSON.parse(rawArgs)
+        } catch {
+          // Leave invalid JSON as-is so schema validation reports the missing/invalid fields.
+        }
+      }
       const schema = conv.activeToolSchemas?.get(targetName)
       const targetArgs = sanitizeMcpToolArguments(rawArgs, schema)
       if (!conv.toolNames.has(targetName)) {

@@ -439,3 +439,147 @@ test('PTC follow-up user/developer images are forwarded as real MCP image blocks
     await runtime.dispose()
   }
 })
+
+test('deliverResults preserves interleaved PTC images, tolerates readImage failures, and wires circuit breaker on fallback turns', async () => {
+  const { AntigravityRuntime } = await import('../lib/runtime.js')
+  const imgBlock = {
+    type: 'image',
+    attachment: {
+      attachmentId: 'sha256:aaaa1111bbbb2222',
+      mediaType: 'image/png',
+      width: 64,
+      height: 64,
+      bytes: 512,
+    },
+  }
+  const fakeBase64 = Buffer.from('png-bytes').toString('base64')
+  let shouldThrow = false
+  const runtime = new AntigravityRuntime({
+    config: {
+      provider: 'antigravity',
+      displayName: 'Antigravity',
+      command: '',
+      home: '',
+      accounts: [],
+      contextWindow: 0,
+      defaultEffort: 'high',
+      autoPatch: false,
+      patchScript: '',
+      maxLiveSessions: 4,
+      idleSessionTtlMs: 600_000,
+      parkSettleMs: 50,
+      keepAliveMs: 1_000,
+      longDecodeContinuations: 3,
+      warmup: false,
+      quotaTtlMs: 60_000,
+      engineMode: 'safe-bridge',
+      circuitBreakerOn429: true,
+    },
+    spawnAcp: () => { throw new Error('unused') },
+    runCommand: async () => ({ code: 0, stdout: '', stderr: '' }),
+    readImage: async () => {
+      if (shouldThrow) throw new Error('ENOENT attachment missing')
+      return { data: fakeBase64, mimeType: 'image/png' }
+    },
+    canReadImages: () => true,
+    log: { info: () => undefined, warn: () => undefined },
+    onModelsChanged: () => undefined,
+  })
+  try {
+    // 1. Interleaved PTC user image between two concurrent tool calls is preserved
+    const turn1 = new AcpTurn('interlv1', false)
+    const resolved = new Map()
+    for (const id of ['c1', 'c2']) {
+      turn1.pendingCalls.set(id, {
+        id,
+        name: 'run_code',
+        argumentsJson: '{}',
+        result: { resolve: value => resolved.set(id, value), reject: () => undefined },
+      })
+    }
+    const conv1 = {
+      key: 'k1',
+      sessionId: 'sess-1',
+      turn: turn1,
+      engineMode: 'safe-bridge',
+      advertisedToolNames: new Set(['run_code']),
+      knownTools: new Map([['run_code', 'h']]),
+      reportedToolCalls: new Map(),
+      promptGen: 0,
+      promptSettled: Promise.resolve(),
+    }
+    const ok1 = await runtime.deliverResults(conv1, { layout: { geminiDir: '/tmp' } }, [
+      { id: 't1', role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: '{"ok":1}' }] },
+      { id: 'u1', role: 'user', content: [{ type: 'text', text: 'ptc image between c1 and c2' }, imgBlock] },
+      { id: 't2', role: 'tool', toolCallId: 'c2', content: [{ type: 'text', text: '{"ok":2}' }] },
+    ], {}, [])
+    assert.equal(ok1, true)
+    assert.ok(resolved.get('c2')?.content.some(item => item.type === 'image' && item.data === fakeBase64))
+
+    // 2. Throwing readImage degrades gracefully instead of leaving parked calls unresolved
+    shouldThrow = true
+    const turn2 = new AcpTurn('errimg01', false)
+    let resolved2 = null
+    turn2.pendingCalls.set('c3', {
+      id: 'c3',
+      name: 'read_image',
+      argumentsJson: '{}',
+      result: { resolve: value => { resolved2 = value }, reject: () => undefined },
+    })
+    const conv2 = {
+      key: 'k2',
+      sessionId: 'sess-2',
+      turn: turn2,
+      engineMode: 'safe-bridge',
+      advertisedToolNames: new Set(['read_image']),
+      knownTools: new Map([['read_image', 'h']]),
+      reportedToolCalls: new Map(),
+    }
+    const ok2 = await runtime.deliverResults(conv2, { layout: { geminiDir: '/tmp' } }, [
+      { id: 't3', role: 'tool', toolCallId: 'c3', content: [imgBlock] },
+    ], {}, [])
+    assert.equal(ok2, true)
+    assert.ok(resolved2?.content.some(item => item.type === 'text' && item.text.includes('unavailable')))
+
+    // 3. Fallback path (turn.finished === true) forwards images AND attaches 429 circuit breaker
+    shouldThrow = false
+    const turn3 = new AcpTurn('fallbk01', false)
+    turn3.finished = true
+    turn3.pendingCalls.set('c4', {
+      id: 'c4',
+      name: 'run_code',
+      argumentsJson: '{}',
+      result: { resolve: () => undefined, reject: () => undefined },
+    })
+    const cancelled = []
+    let sentBlocks = null
+    const fakeProc = {
+      cancel: sid => cancelled.push(sid),
+      prompt: async (_sid, blocks) => { sentBlocks = blocks; return { stopReason: 'end_turn' } },
+    }
+    const conv3 = {
+      key: 'k3',
+      sessionId: 'sess-3',
+      turn: turn3,
+      engineMode: 'safe-bridge',
+      advertisedToolNames: new Set(['run_code']),
+      knownTools: new Map([['run_code', 'h']]),
+      reportedToolCalls: new Map(),
+      promptGen: 0,
+      promptSettled: Promise.resolve(),
+    }
+    const ok3 = await runtime.deliverResults(conv3, { layout: { geminiDir: '/tmp' } }, [
+      { id: 't4', role: 'tool', toolCallId: 'c4', content: [{ type: 'text', text: '{"ok":4}' }] },
+      { id: 'u4', role: 'user', content: [imgBlock] },
+    ], fakeProc, [])
+    assert.equal(ok3, true)
+    assert.ok(Array.isArray(sentBlocks) && sentBlocks.some(b => b.type === 'image' && b.data === fakeBase64))
+    conv3.turn.onUpdate({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: '⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): quota' },
+    })
+    assert.deepEqual(cancelled, ['sess-3'], 'fallback AcpTurn must still trigger 429 circuit breaker')
+  } finally {
+    await runtime.dispose()
+  }
+})
