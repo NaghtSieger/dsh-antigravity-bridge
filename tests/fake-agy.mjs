@@ -549,6 +549,10 @@ async function runPrompt(s, text) {
     update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'part-one ' } })
     return { stopReason: 'max_tokens', usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } }
   }
+  if (text.startsWith('Past conversation, continued across messages.') || text.startsWith('Session context and guidelines, continued across messages.')) {
+    update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: process.env.FAKE_AGY_ACK_TEXT ?? 'ACK' } })
+    return { stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 2, cachedReadTokens: 0, cachedWriteTokens: 0, thoughtTokens: 0, totalTokens: 102 } }
+  }
   const reply = output.length > 0 ? output.join(' | ') : `echo:${s.model}:${s.level}:${text.slice(-40)}`
   update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: reply } })
   return { stopReason: 'end_turn', usage: { inputTokens: 600, outputTokens: 50, cachedReadTokens: 400, cachedWriteTokens: 0, thoughtTokens: 20, totalTokens: 1050 } }

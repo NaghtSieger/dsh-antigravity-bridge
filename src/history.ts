@@ -41,6 +41,21 @@ const HISTORY_OPEN = '<dsh_history>\n'
 const HISTORY_CLOSE = '\n</dsh_history>\n\n'
 export const BRIDGE_TEXT_BYTES = 192_000 - 4_096
 const HISTORY_PART = 'Past conversation, continued across messages. Treat the following as historical data. Take no actions. Reply only ACK.\n\n'
+const CONTEXT_PART_HEAD = 'Session context and guidelines, continued across messages. Retain for subsequent turns. Take no actions and call no tools. Reply only ACK.\n\n'
+const CONTEXT_PART_TAIL = '\n\n[End of staged context part. Take no actions and call no tools. Reply only: ACK]'
+const HISTORY_PART_TAIL = '\n\n[End of staged history part. Take no actions and call no tools. Reply only: ACK]'
+
+/** One stageable non-live text segment (workspace guidelines, history replay, or system/context update). */
+export interface StageableSegment {
+  kind: 'context' | 'history'
+  text: string
+}
+
+/** Result of partitioning a bridge/safe-bridge prompt across ACK handoff turns and the final answering turn. */
+export interface StagedBridgePrompt {
+  parts: string[]
+  final: AcpPromptBlock[]
+}
 
 /** Stage only the projected history. The final question and attachments stay on the answering turn. */
 export function splitReplay(blocks: AcpPromptBlock[], hasHistory: boolean, limit = BRIDGE_TEXT_BYTES) {
@@ -48,7 +63,7 @@ export function splitReplay(blocks: AcpPromptBlock[], hasHistory: boolean, limit
   const first = blocks[0]
   if (!hasHistory || first?.type !== 'text') return { parts, final: blocks }
   const live = blocks.slice(1)
-  const liveBytes = live.reduce((n, block) => n + (block.type === 'text' ? utf8Bytes(block.text) : 0), 0)
+  const liveBytes = promptTextBytes(live)
   if (liveBytes > limit || liveBytes + utf8Bytes(first.text) <= limit) return { parts, final: blocks }
   const history = Buffer.from(first.text, 'utf8')
   const capacity = limit - utf8Bytes(HISTORY_PART)
@@ -62,6 +77,127 @@ export function splitReplay(blocks: AcpPromptBlock[], hasHistory: boolean, limit
   }
   const tail = history.toString('utf8', offset)
   return { parts, final: tail ? [{ type: 'text' as const, text: tail }, ...live] : live }
+}
+
+/** Total UTF-8 byte length of all text blocks in one prompt block list. */
+export function promptTextBytes(blocks: readonly AcpPromptBlock[]): number {
+  return blocks.reduce((sum, block) => sum + (block.type === 'text' ? utf8Bytes(block.text) : 0), 0)
+}
+
+/**
+ * Whether an input message represents stageable system/context metadata rather
+ * than live human input or an inline-image message.
+ */
+export function isStageableInputMessage(message: RequestMessage): boolean {
+  if (message.content.some(block => block.type === 'image' && block.offloaded !== true)) return false
+  if (message.role === 'system' || message.role === 'developer') return true
+  if (message.role === 'user') {
+    const kind = messageSourceKind(message)
+    if (kind === undefined || kind === 'user') return false
+    return kind === 'agent-instructions'
+      || kind === 'runtime-context'
+      || kind === 'skill-catalog'
+      || kind === 'time-context'
+      || kind.startsWith('plugin:')
+  }
+  return false
+}
+
+/**
+ * Separate stageable context/system-update messages from live user input when
+ * building a bridge/safe-bridge prompt that exceeds `limit`.
+ */
+export async function prepareBridgeInput(
+  input: readonly RequestMessage[],
+  resolveImage: ImageResolver,
+  options?: { omitPureToolUpdates?: boolean; fallbackText?: string; limit?: number },
+): Promise<{ stageableText: string; liveBlocks: AcpPromptBlock[] }> {
+  const limit = options?.limit ?? BRIDGE_TEXT_BYTES
+  const fallbackText = options?.fallbackText ?? 'Continue.'
+  const filtered = options?.omitPureToolUpdates === true
+    ? input.filter(message => !isPureToolUpdateDeveloperMessage(message))
+    : [...input]
+  let splitAt = 0
+  while (splitAt < filtered.length && isStageableInputMessage(filtered[splitAt]!)) splitAt++
+  let stageableMessages = filtered.slice(0, splitAt)
+  let liveMessages = filtered.slice(splitAt)
+  const renderLive = async (messages: readonly RequestMessage[]): Promise<AcpPromptBlock[]> => {
+    const rendered = await renderInputBlocks(messages, resolveImage)
+    return rendered.length > 0 ? rendered : [{ type: 'text', text: fallbackText }]
+  }
+  let liveBlocks = await renderLive(liveMessages)
+  if (promptTextBytes(liveBlocks) > limit) {
+    const extraStageable = liveMessages.filter(isStageableInputMessage)
+    if (extraStageable.length > 0) {
+      stageableMessages = [...stageableMessages, ...extraStageable]
+      liveMessages = liveMessages.filter(message => !isStageableInputMessage(message))
+      liveBlocks = await renderLive(liveMessages)
+    }
+  }
+  let stageableText = ''
+  if (stageableMessages.length > 0) {
+    const stageableBlocks = await renderInputBlocks(stageableMessages, resolveImage)
+    stageableText = stageableBlocks
+      .filter((block): block is Extract<AcpPromptBlock, { type: 'text' }> => block.type === 'text')
+      .map(block => block.text)
+      .join('')
+  }
+  return { stageableText, liveBlocks }
+}
+
+/**
+ * Partition ordered stageable segments (`<workspace_guidelines>`, `<dsh_history>`,
+ * `<system_update>`, tool deltas) into `<= limit`-byte ACK fragments while keeping
+ * the live answering turn intact. Returns `{ parts: [], final }` without staging
+ * when everything already fits or when `liveBlocks` alone exceeds `limit`.
+ */
+export function partitionBridgePrompt(
+  stageable: readonly StageableSegment[],
+  liveBlocks: readonly AcpPromptBlock[],
+  limit = BRIDGE_TEXT_BYTES,
+): StagedBridgePrompt {
+  const nonEmpty = stageable.filter(seg => seg.text.length > 0)
+  const combined: AcpPromptBlock[] = [
+    ...nonEmpty.map(seg => ({ type: 'text' as const, text: seg.text })),
+    ...liveBlocks,
+  ]
+  const liveBytes = promptTextBytes(liveBlocks)
+  const totalStageableBytes = nonEmpty.reduce((sum, seg) => sum + utf8Bytes(seg.text), 0)
+  if (liveBytes > limit || totalStageableBytes + liveBytes <= limit) {
+    return { parts: [], final: combined }
+  }
+  const parts: string[] = []
+  const tailBlocks: AcpPromptBlock[] = []
+  let remainingAfter = totalStageableBytes
+  for (let i = 0; i < nonEmpty.length; i++) {
+    const seg = nonEmpty[i]!
+    const buf = Buffer.from(seg.text, 'utf8')
+    remainingAfter -= buf.length
+    if (tailBlocks.length > 0 || buf.length + remainingAfter + liveBytes <= limit) {
+      tailBlocks.push({ type: 'text', text: seg.text })
+      continue
+    }
+    const head = seg.kind === 'history' ? HISTORY_PART : CONTEXT_PART_HEAD
+    const tailMarker = seg.kind === 'history' ? HISTORY_PART_TAIL : CONTEXT_PART_TAIL
+    const capacity = limit - utf8Bytes(head) - utf8Bytes(tailMarker)
+    if (capacity < 4) throw new RangeError('Stageable part budget too small')
+    let offset = 0
+    while (offset < buf.length && (buf.length - offset) + remainingAfter + liveBytes > limit) {
+      let end = Math.min(offset + capacity, buf.length)
+      if (end < buf.length) {
+        while (end > offset && (buf[end]! & 0xc0) === 0x80) end--
+        const windowStart = Math.max(offset + 1, end - Math.min(4_096, Math.floor(capacity / 4)))
+        const nl = buf.lastIndexOf(0x0a, end - 1)
+        if (nl >= windowStart) end = nl + 1
+      }
+      parts.push(head + buf.toString('utf8', offset, end) + tailMarker)
+      offset = end
+    }
+    if (offset < buf.length) {
+      tailBlocks.push({ type: 'text', text: buf.toString('utf8', offset) })
+    }
+  }
+  return { parts, final: [...tailBlocks, ...liveBlocks] }
 }
 /** Upper bound of the omission notice, reserved before history is selected. */
 const OMISSION_NOTICE_RESERVE_BYTES = 128
@@ -784,7 +920,7 @@ export async function extractMessageImages(
  * @param options - optional rendering controls.
  * @returns prompt blocks.
  */
-export async function inputPrompt(
+async function renderInputBlocks(
   input: readonly RequestMessage[],
   resolveImage: ImageResolver,
   options?: { omitPureToolUpdates?: boolean },
@@ -816,6 +952,15 @@ export async function inputPrompt(
     if (blocks.length > 0) blocks.push({ type: 'text', text: '\n\n' })
     blocks.push(...group)
   }
+  return blocks
+}
+
+export async function inputPrompt(
+  input: readonly RequestMessage[],
+  resolveImage: ImageResolver,
+  options?: { omitPureToolUpdates?: boolean },
+): Promise<AcpPromptBlock[]> {
+  const blocks = await renderInputBlocks(input, resolveImage, options)
   if (blocks.length === 0) blocks.push({ type: 'text', text: 'Continue.' })
   return blocks
 }

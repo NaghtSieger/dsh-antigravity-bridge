@@ -9,8 +9,10 @@
  */
 
 import type { Readable, Writable } from 'node:stream'
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import { AcpTurn } from './conversation.ts'
 import { JsonRpcPeer, JsonRpcRemoteError } from './jsonrpc.ts'
+import { labeled } from './labels.ts'
 
 /** Minimal handle of a spawned ACP process. */
 export interface AcpChild {
@@ -277,8 +279,13 @@ export class AcpProcess {
       }
       reply += receipt.recoverNoticeHold()
       if (receipt.agentFailure) throw receipt.agentFailure
-      if (result.stopReason !== 'end_turn' || reply.trim() !== 'ACK') {
-        throw new Error(`History fragment was not acknowledged (${result.stopReason})`)
+      const trimmedReply = reply.trim()
+      if (result.stopReason !== 'end_turn' || !/^[`"'*\s]*ACK[`"'*.\s!]*$/i.test(trimmedReply)) {
+        const preview = trimmedReply.length > 0 ? `: ${trimmedReply.slice(0, 80)}` : ''
+        throw new LlmError(
+          labeled('TRANSPORT', `History fragment was not acknowledged (${result.stopReason}${preview})`),
+          'TRANSPORT',
+        )
       }
     } catch (error) {
       if (stop.aborted) this.cancel(sessionId)

@@ -583,3 +583,244 @@ test('deliverResults preserves interleaved PTC images, tolerates readImage failu
     await runtime.dispose()
   }
 })
+
+test('safe-bridge stages oversized workspace_guidelines, history, and in-history system updates across <= BRIDGE_TEXT_BYTES turns', async () => {
+  const { spawn } = await import('node:child_process')
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join, resolve } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const { AntigravityRuntime } = await import('../lib/runtime.js')
+  const { AntigravityAdapter } = await import('../lib/adapter.js')
+  const { BRIDGE_TEXT_BYTES } = await import('../lib/history.js')
+
+  const fake = resolve(fileURLToPath(new URL('./fake-agy.mjs', import.meta.url)))
+  const home = mkdtempSync(join(tmpdir(), 'agy-safe-bridge-stage-'))
+  const promptLog = join(home, 'prompts.jsonl')
+  const readPrompts = () => readFileSync(promptLog, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+
+  const runtime = new AntigravityRuntime({
+    config: {
+      provider: 'antigravity',
+      displayName: 'Antigravity',
+      command: fake,
+      home,
+      accounts: [{ id: 'default', displayName: '', home: '', enabled: true, env: {}, contextWindow: 0, system: true, visibleModels: [], priority: 1, weight: 1 }],
+      contextWindow: 0,
+      defaultEffort: 'high',
+      autoPatch: false,
+      patchScript: '',
+      maxLiveSessions: 4,
+      idleSessionTtlMs: 600_000,
+      parkSettleMs: 50,
+      keepAliveMs: 1_000,
+      longDecodeContinuations: 3,
+      warmup: false,
+      quotaTtlMs: 60_000,
+      engineMode: 'safe-bridge',
+      circuitBreakerOn429: true,
+    },
+    spawnAcp: (argv, cwd, env) => {
+      const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], {
+        cwd,
+        env: { ...process.env, ...env, FAKE_AGY_LOG: promptLog, FAKE_AGY_ACK_TEXT: 'ACK.' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr.on('data', chunk => { stderr += chunk.toString('utf8') })
+      return {
+        stdin: child.stdin,
+        stdout: child.stdout,
+        exited: new Promise(resolveExit => child.once('exit', (code, signal) => resolveExit({ code, signal }))),
+        terminate: () => child.kill('SIGTERM'),
+        stderrTail: () => stderr,
+      }
+    },
+    runCommand: async (argv) => argv.includes('--version')
+      ? { code: 0, stdout: '1.5.15\n', stderr: '' }
+      : { code: 0, stdout: '', stderr: '' },
+    readImage: async () => undefined,
+    canReadImages: () => false,
+    log: { info: () => undefined, warn: () => undefined },
+    onModelsChanged: () => undefined,
+  })
+  const adapter = new AntigravityAdapter(runtime, 'Antigravity', () => false)
+  const collect = async (iter) => {
+    const out = []
+    for await (const c of iter) out.push(c)
+    return out
+  }
+  try {
+    // 1. Brand-new safe-bridge session with >187KB system prompt and tiny user input (zero history)
+    const hugeSystem = `HEADER_RULE\n${'interface ToolA { x: string }\n'.repeat(7500)}FOOTER_RULE`
+    assert.ok(Buffer.byteLength(hugeSystem, 'utf8') > BRIDGE_TEXT_BYTES)
+    const chunks1 = await collect(adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'stage-fresh',
+      tools: [READ_TOOL],
+      messages: [
+        { id: 'sys-1', role: 'system', content: [{ type: 'text', text: hugeSystem }] },
+        { id: 'u-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'LIVE_Q_1' }] },
+      ],
+    }))
+    assert.equal(chunks1.at(-1).reason.kind, 'stop')
+    const p1 = readPrompts()
+    assert.ok(p1.length >= 2, 'oversized guidelines must be staged across multiple prompts')
+    assert.ok(p1.every(entry => Buffer.byteLength(entry.text, 'utf8') <= BRIDGE_TEXT_BYTES), 'every ACP prompt stays within BRIDGE_TEXT_BYTES')
+    const allText1 = p1.map(entry => entry.text).join('\n')
+    assert.ok(allText1.includes('HEADER_RULE') && allText1.includes('FOOTER_RULE'))
+    assert.ok(p1.at(-1).text.includes('LIVE_Q_1'))
+    assert.ok(!p1.slice(0, -1).some(entry => entry.text.includes('LIVE_Q_1')), 'live user prompt stays on final answering turn')
+
+    // 2. Rebuilt session with >100KB guidelines + >210KB history + >190KB in-history system update + small user/plugin input
+    const beforeCount2 = p1.length
+    const sys1 = `OLD_SYS_START\n${'a'.repeat(104_000)}\nOLD_SYS_END`
+    const sys2 = `NEW_SYS_START\n${'b'.repeat(190_000)}\nNEW_SYS_END`
+    const histBody = `HIST_START\n${'🟢中文'.repeat(25_000)}\nHIST_END`
+    const chunks2 = await collect(adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'stage-rebuild',
+      tools: [READ_TOOL],
+      messages: [
+        { id: 's1', role: 'system', content: [{ type: 'text', text: sys1 }] },
+        { id: 'u-hist', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: histBody }] },
+        { id: 'a-hist', role: 'assistant', source: { kind: 'model', provider: 'antigravity' }, content: [{ type: 'text', text: 'done turn 1' }] },
+        { id: 's2', role: 'system', content: [{ type: 'text', text: sys2 }] },
+        { id: 'u-2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'LIVE_Q_2' }] },
+        { id: 'p-2', role: 'user', source: { kind: 'plugin:dsh-claude-compat', form: 'hook-context' }, content: [{ type: 'text', text: '全程用简体中文' }] },
+      ],
+    }))
+    assert.equal(chunks2.at(-1).reason.kind, 'stop')
+    const p2 = readPrompts().slice(beforeCount2)
+    assert.ok(p2.length >= 4, '422KB+ rebuild must stage into multiple <= BRIDGE_TEXT_BYTES prompts')
+    assert.ok(p2.every(entry => Buffer.byteLength(entry.text, 'utf8') <= BRIDGE_TEXT_BYTES))
+    const allText2 = p2.map(entry => entry.text).join('\n')
+    assert.ok(allText2.includes('OLD_SYS_START') && allText2.includes('OLD_SYS_END'))
+    assert.ok(allText2.includes('HIST_START') && allText2.includes('HIST_END'))
+    assert.ok(allText2.includes('NEW_SYS_START') && allText2.includes('NEW_SYS_END'))
+    assert.ok(p2.at(-1).text.includes('LIVE_Q_2'))
+    assert.ok(p2.at(-1).text.includes('全程用简体中文'))
+
+    // 3. Incremental warm turn with oversized in-history system update (>190KB) keeps session alive and stages update
+    const beforeCount3 = readPrompts().length
+    const warmSession = p2.at(-1).session
+    const sys3 = `WARM_SYS_START\n${'c'.repeat(190_000)}\nWARM_SYS_END`
+    const chunks3 = await collect(adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'stage-rebuild',
+      tools: [READ_TOOL],
+      messages: [
+        { id: 's1', role: 'system', content: [{ type: 'text', text: sys1 }] },
+        { id: 'u-hist', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: histBody }] },
+        { id: 'a-hist', role: 'assistant', source: { kind: 'model', provider: 'antigravity' }, content: [{ type: 'text', text: 'done turn 1' }] },
+        { id: 's2', role: 'system', content: [{ type: 'text', text: sys2 }] },
+        { id: 'u-2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'LIVE_Q_2' }] },
+        { id: 'p-2', role: 'user', source: { kind: 'plugin:dsh-claude-compat', form: 'hook-context' }, content: [{ type: 'text', text: '全程用简体中文' }] },
+        { id: 'a-2', role: 'assistant', source: { kind: 'model', provider: 'antigravity' }, content: [{ type: 'text', text: 'turn 2 ok' }] },
+        { id: 's3', role: 'system', content: [{ type: 'text', text: sys3 }] },
+        { id: 'u-3', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'LIVE_Q_3' }] },
+      ],
+    }))
+    assert.equal(chunks3.at(-1).reason.kind, 'stop')
+    const p3 = readPrompts().slice(beforeCount3)
+    assert.ok(p3.length >= 2)
+    assert.ok(p3.every(entry => entry.session === warmSession), 'warm incremental turn must stay in same ACP session')
+    assert.ok(p3.every(entry => Buffer.byteLength(entry.text, 'utf8') <= BRIDGE_TEXT_BYTES))
+    assert.ok(p3.map(e => e.text).join('\n').includes('WARM_SYS_START'))
+    assert.ok(p3.at(-1).text.includes('LIVE_Q_3'))
+
+    // 4. Oversized human user message itself still rejects immediately with CONTEXT_WINDOW_EXCEEDED and zero prompts sent
+    const beforeCount4 = readPrompts().length
+    await assert.rejects(collect(adapter.stream({
+      provider: 'antigravity',
+      model: 'gemini-4-argon',
+      sessionId: 'stage-over-user',
+      messages: [
+        { id: 's-small', role: 'system', content: [{ type: 'text', text: 'You are DSH.' }] },
+        { id: 'u-big', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '猫'.repeat(66_000) }] },
+      ],
+    })), { code: 'CONTEXT_WINDOW_EXCEEDED' })
+    assert.equal(readPrompts().length, beforeCount4, 'oversized human user message must not call the model')
+  } finally {
+    await runtime.dispose()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('receiveHistory classifies non-ACK prose as TRANSPORT even if reply mentions context or rate limit', async () => {
+  const { spawn } = await import('node:child_process')
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join, resolve } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const { AntigravityRuntime } = await import('../lib/runtime.js')
+  const { AntigravityAdapter } = await import('../lib/adapter.js')
+
+  const fake = resolve(fileURLToPath(new URL('./fake-agy.mjs', import.meta.url)))
+  const home = mkdtempSync(join(tmpdir(), 'agy-non-ack-'))
+  const runtime = new AntigravityRuntime({
+    config: {
+      provider: 'antigravity',
+      displayName: 'Antigravity',
+      command: fake,
+      home,
+      accounts: [{ id: 'default', displayName: '', home: '', enabled: true, env: {}, contextWindow: 0, system: true, visibleModels: [], priority: 1, weight: 1 }],
+      contextWindow: 0,
+      defaultEffort: 'high',
+      autoPatch: false,
+      patchScript: '',
+      maxLiveSessions: 4,
+      idleSessionTtlMs: 600_000,
+      parkSettleMs: 50,
+      keepAliveMs: 1_000,
+      longDecodeContinuations: 3,
+      warmup: false,
+      quotaTtlMs: 60_000,
+      engineMode: 'safe-bridge',
+      circuitBreakerOn429: true,
+    },
+    spawnAcp: (argv, cwd, env) => {
+      const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], {
+        cwd,
+        env: { ...process.env, ...env, FAKE_AGY_ACK_TEXT: 'Understood, retained the context without hitting rate limit.' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr.on('data', chunk => { stderr += chunk.toString('utf8') })
+      return {
+        stdin: child.stdin,
+        stdout: child.stdout,
+        exited: new Promise(resolveExit => child.once('exit', (code, signal) => resolveExit({ code, signal }))),
+        terminate: () => child.kill('SIGTERM'),
+        stderrTail: () => stderr,
+      }
+    },
+    runCommand: async (argv) => argv.includes('--version')
+      ? { code: 0, stdout: '1.5.15\n', stderr: '' }
+      : { code: 0, stdout: '', stderr: '' },
+    readImage: async () => undefined,
+    canReadImages: () => false,
+    log: { info: () => undefined, warn: () => undefined },
+    onModelsChanged: () => undefined,
+  })
+  const adapter = new AntigravityAdapter(runtime, 'Antigravity', () => false)
+  try {
+    await assert.rejects(async () => {
+      for await (const _ of adapter.stream({
+        provider: 'antigravity',
+        model: 'gemini-4-argon',
+        sessionId: 'bad-ack',
+        messages: [
+          { id: 'sys', role: 'system', content: [{ type: 'text', text: 'S'.repeat(210_000) }] },
+          { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] },
+        ],
+      })) { /* drain */ }
+    }, error => error.code === 'TRANSPORT' && error.message.includes('History fragment was not acknowledged'))
+  } finally {
+    await runtime.dispose()
+    rmSync(home, { recursive: true, force: true })
+  }
+})

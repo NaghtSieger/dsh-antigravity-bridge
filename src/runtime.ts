@@ -36,9 +36,10 @@ import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type Avai
 import { asDegradeAction, asEffort, asEngineMode, current, EFFORTS, type AccountProfile, type Config, type DegradeAction, type Effort, type EngineMode } from './config.ts'
 import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
 import {
-  BRIDGE_TEXT_BYTES, extractMessageImages, formatSafeBridgeGuidelines, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, MCP_SERVER_NAME, prepareNativeRequest, splitReplay,
+  BRIDGE_TEXT_BYTES, EMPTY_INPUT_CONTINUATION, extractMessageImages, formatSafeBridgeGuidelines, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, MCP_SERVER_NAME,
+  partitionBridgePrompt, prepareBridgeInput, prepareNativeRequest, promptTextBytes,
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
-  type AcpPromptBlock, type ImageResolver, type NativeSandboxMode, type NativeSessionContext,
+  type AcpPromptBlock, type ImageResolver, type NativeSandboxMode, type NativeSessionContext, type StageableSegment,
 } from './history.ts'
 import { labeled } from './labels.ts'
 import { JsonRpcClosedError, JsonRpcRemoteError } from './jsonrpc.ts'
@@ -1280,20 +1281,28 @@ export class AntigravityRuntime {
     }
     const replayBudget = engineMode === 'native' ? (slot.preflight?.unlock.status === 'unlocked' ? UNLOCKED_REPLAY_BUDGET_BYTES : LOCKED_REPLAY_BUDGET_BYTES) : undefined
     let blocks: AcpPromptBlock[]
+    let toolDelta = ''
     if (plan.rebuild) {
       blocks = await replayPrompt(plan.history, plan.input, this.host.readImage, replayBudget)
     } else {
       blocks = await inputPrompt(plan.input, this.host.readImage, { omitPureToolUpdates: true })
-      const toolDelta = consumeToolDelta(conv, tools)
+      toolDelta = consumeToolDelta(conv, tools)
       if (toolDelta.length > 0) blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
     }
     const nextKnownIds = messageIds(preparedMessages)
     const guidelinesBlock = engineMode === 'safe-bridge' && freshSession
       ? this.safeBridgeGuidelinesBlock(systemText, activeSchemas)
       : undefined
-    const reservedBytes = guidelinesBlock !== undefined ? Buffer.byteLength(guidelinesBlock.text, 'utf8') : 0
-    const handoffBlocks = await this.handoff(conv, proc, blocks, plan.rebuild && plan.history.length > 0, options.signal, reservedBytes)
-    const finalBlocks = guidelinesBlock !== undefined ? [guidelinesBlock, ...handoffBlocks] : [...handoffBlocks]
+    const finalBlocks = await this.handoff(conv, proc, {
+      blocks,
+      rebuild: plan.rebuild,
+      history: plan.history,
+      input: plan.input,
+      omitPureToolUpdates: !plan.rebuild,
+      toolDelta,
+      guidelinesBlock,
+      signal: options.signal,
+    })
     conv.reportedToolCalls.clear()
     conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native', this.createCircuitBreaker(conv, proc))
     conv.health.beginTurn()
@@ -1357,6 +1366,7 @@ export class AntigravityRuntime {
     conv.reportedToolCalls.clear()
     conv.health.beginTurn()
     let blocks: AcpPromptBlock[]
+    let replayPlan: ReturnType<typeof planPrompt> | undefined
     if (fresh) {
       // A cold session that never finished a round is replaced with its own prompt
       // replayed verbatim; a session whose recorded blocks were incremental gets a
@@ -1364,9 +1374,10 @@ export class AntigravityRuntime {
       // the conversation that session was already carrying.
       const replayEscaped = state.blocksAreReplay !== true && original.length > 0
       await this.resetSession(conv)
-      const plan = replayEscaped
+      const computedPlan = replayEscaped || (original.length > 0 && state.blocksAreReplay === true)
         ? planPrompt(conv, system, messages, this.host.config.provider)
         : undefined
+      const plan = replayEscaped ? computedPlan : undefined
       conv.reanswer.key = state.key
       conv.reanswer.granted = state.granted
       conv.reanswer.blocks = original
@@ -1375,8 +1386,6 @@ export class AntigravityRuntime {
       // Tag the replayed system text so the fresh session's first 2048-token block hashes
       // differently upstream: the fallback pool's prefix cache no longer matches this request.
       await this.openSession(conv, slot, engineMode, effectiveCwd, `[reanswer:${conv.tag}:${state.granted}]\n\n${system}`, activeSchemas, tools, proc)
-      const freshDb = sessionDbPath(slot.layout.geminiDir, conv.sessionId as string)
-      this.pinUsageCursors(conv, freshDb)
       await this.select(conv, proc, options.model, effort)
       if (plan !== undefined) {
         const replayBudget = engineMode === 'native' ? (slot.preflight?.unlock.status === 'unlocked' ? UNLOCKED_REPLAY_BUDGET_BYTES : LOCKED_REPLAY_BUDGET_BYTES) : undefined
@@ -1385,8 +1394,12 @@ export class AntigravityRuntime {
         // stale incremental input the replaced session was originally sent.
         conv.reanswer.blocks = blocks
         conv.reanswer.blocksAreReplay = true
+        replayPlan = plan
+      } else if (original.length > 0) {
+        blocks = original
+        replayPlan = computedPlan
       } else {
-        blocks = original.length > 0 ? original : [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
+        blocks = [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
       }
     } else {
       conv.promptGen++
@@ -1395,13 +1408,21 @@ export class AntigravityRuntime {
     }
     conv.sandboxMode = sandboxMode
     conv.writableRoots = writableRoots
-    const hasHistory = fresh && planPrompt(conv, system, messages, this.host.config.provider).history.length > 0
     const guidelinesBlock = engineMode === 'safe-bridge' && fresh
       ? this.safeBridgeGuidelinesBlock(`[reanswer:${conv.tag}:${state.granted}]\n\n${system}`, activeSchemas)
       : undefined
-    const reservedBytes = guidelinesBlock !== undefined ? Buffer.byteLength(guidelinesBlock.text, 'utf8') : 0
-    const handoffBlocks = await this.handoff(conv, proc, blocks, hasHistory, options.signal, reservedBytes)
-    const finalBlocks = guidelinesBlock !== undefined ? [guidelinesBlock, ...handoffBlocks] : handoffBlocks
+    const finalBlocks = await this.handoff(conv, proc, {
+      blocks,
+      rebuild: replayPlan !== undefined,
+      history: replayPlan?.history ?? [],
+      input: replayPlan?.input ?? [],
+      omitPureToolUpdates: false,
+      guidelinesBlock,
+      signal: options.signal,
+    })
+    if (fresh && conv.sessionId !== undefined) {
+      this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
+    }
     conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native', this.createCircuitBreaker(conv, proc, 'during reanswer'))
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
@@ -1867,16 +1888,54 @@ export class AntigravityRuntime {
   private async handoff(
     conv: Conversation,
     proc: AcpProcess,
-    blocks: AcpPromptBlock[],
-    hasHistory: boolean,
-    signal?: AbortSignal,
-    reservedBytes = 0,
+    params: {
+      blocks: AcpPromptBlock[]
+      rebuild: boolean
+      history: readonly RequestMessage[]
+      input: readonly RequestMessage[]
+      omitPureToolUpdates: boolean
+      toolDelta?: string | undefined
+      guidelinesBlock?: { type: 'text'; text: string } | undefined
+      signal?: AbortSignal | undefined
+    },
   ): Promise<AcpPromptBlock[]> {
-    if ((conv.engineMode !== 'bridge' && conv.engineMode !== 'safe-bridge') || !hasHistory) return blocks
-    const limit = Math.max(1_024, BRIDGE_TEXT_BYTES - reservedBytes)
-    const { parts, final } = splitReplay(blocks, true, limit)
+    const combined = params.guidelinesBlock !== undefined
+      ? [params.guidelinesBlock, ...params.blocks]
+      : [...params.blocks]
+    if (conv.engineMode !== 'bridge' && conv.engineMode !== 'safe-bridge') return combined
+    if (promptTextBytes(combined) <= BRIDGE_TEXT_BYTES) return combined
+
+    const stageable: StageableSegment[] = []
+    if (params.guidelinesBlock !== undefined) {
+      stageable.push({ kind: 'context', text: params.guidelinesBlock.text })
+    }
+    const hasHistoryBlock = params.rebuild && params.history.length > 0 && params.blocks[0]?.type === 'text'
+    if (hasHistoryBlock) {
+      stageable.push({ kind: 'history', text: (params.blocks[0] as Extract<AcpPromptBlock, { type: 'text' }>).text })
+    }
+    if (!params.rebuild && params.toolDelta !== undefined && params.toolDelta.length > 0) {
+      stageable.push({ kind: 'context', text: `${params.toolDelta}\n\n` })
+    }
+
+    let liveBlocks: AcpPromptBlock[]
+    if (params.input.length > 0) {
+      const prepared = await prepareBridgeInput(params.input, this.host.readImage, {
+        omitPureToolUpdates: params.omitPureToolUpdates,
+        fallbackText: hasHistoryBlock ? EMPTY_INPUT_CONTINUATION : 'Continue.',
+        limit: BRIDGE_TEXT_BYTES,
+      })
+      if (prepared.stageableText.length > 0) {
+        stageable.push({ kind: 'context', text: `${prepared.stageableText}\n\n` })
+      }
+      liveBlocks = prepared.liveBlocks
+    } else {
+      liveBlocks = hasHistoryBlock ? params.blocks.slice(1) : params.blocks
+    }
+
+    const { parts, final } = partitionBridgePrompt(stageable, liveBlocks, BRIDGE_TEXT_BYTES)
+    if (parts.length === 0) return combined
     try {
-      for (const part of parts) await proc.receiveHistory(conv.sessionId!, part, signal)
+      for (const part of parts) await proc.receiveHistory(conv.sessionId!, part, params.signal)
     } catch (error) {
       await this.resetSession(conv)
       throw error
@@ -1887,7 +1946,7 @@ export class AntigravityRuntime {
   private startPrompt(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[], waitForFirstResponse = false, signal?: AbortSignal): void {
     const turn = conv.turn as AcpTurn
     if (conv.engineMode === 'bridge' || conv.engineMode === 'safe-bridge') {
-      const bytes = blocks.reduce((sum, b) => sum + (b.type === 'text' ? Buffer.byteLength(b.text) : 0), 0)
+      const bytes = promptTextBytes(blocks)
       if (bytes > BRIDGE_TEXT_BYTES) {
         turn.events.push({ kind: 'error', error: new LlmError(
           `Bridge input requires ${bytes} UTF-8 bytes, exceeding the ${BRIDGE_TEXT_BYTES}-byte ACP input budget. Compact the DSH context before replay.`,
