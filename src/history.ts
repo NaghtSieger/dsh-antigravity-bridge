@@ -755,6 +755,27 @@ export async function inputPrompt(
     let group: AcpPromptBlock[]
     if (message.role === 'user') {
       group = await promptBlocks(message.content, resolveImage)
+    } else if (
+      (message.role === 'developer' || message.role === 'tool')
+      && message.content.some(b => b.type === 'image' && b.offloaded !== true)
+    ) {
+      const remaining: ContentBlock[] = []
+      const resolvedImages: AcpPromptBlock[] = []
+      for (const block of message.content) {
+        if (block.type === 'image' && block.offloaded !== true) {
+          const image = await resolveImage(block)
+          if (image !== undefined) resolvedImages.push({ type: 'image', data: image.data, mimeType: image.mimeType })
+          else remaining.push({ type: 'text', text: `[image ${block.attachment.attachmentId} unavailable]` })
+        } else {
+          remaining.push(block)
+        }
+      }
+      group = []
+      if (remaining.length > 0) {
+        const text = renderTranscript([{ ...message, content: remaining } as RequestMessage])
+        if (text.length > 0) group.push({ type: 'text', text })
+      }
+      group.push(...resolvedImages)
     } else {
       const text = renderTranscript([message])
       group = text.length > 0 ? [{ type: 'text', text }] : []

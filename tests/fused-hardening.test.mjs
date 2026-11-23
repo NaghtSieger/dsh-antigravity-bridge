@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Config, current, ENGINE_MODES } from '../lib/config.js'
 import { AcpTurn, classifyAgentNotice } from '../lib/conversation.js'
-import { formatSafeBridgeGuidelines } from '../lib/history.js'
+import { formatSafeBridgeGuidelines, inputPrompt } from '../lib/history.js'
 import { sanitizeChildEnv, STRIPPED_AUTH_ENV_KEYS } from '../lib/preflight.js'
 import {
   answerPermission,
@@ -333,5 +333,109 @@ test('safe-bridge end-to-end omits --agent dsh-bridge, keeps systemInstruction u
   } finally {
     await runtime.dispose()
     rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('PTC follow-up user/developer images are forwarded as real MCP image blocks instead of [image sha256:...] placeholders', async () => {
+  const { AntigravityRuntime } = await import('../lib/runtime.js')
+  const imgBlock = {
+    type: 'image',
+    attachment: {
+      attachmentId: 'sha256:0cd5cb76bddca406987d009daecaee65f46e09422f88150d9c16eec785ee40bb',
+      mediaType: 'image/webp',
+      width: 317,
+      height: 349,
+      bytes: 14262,
+    },
+  }
+  const fakeBase64 = Buffer.from('fake-webp-bytes').toString('base64')
+  const readImage = async () => ({ data: fakeBase64, mimeType: 'image/webp' })
+
+  // 1. inputPrompt preserves image blocks in tool/developer messages too
+  const promptBlocks = await inputPrompt([
+    {
+      id: 'dev-1',
+      role: 'developer',
+      content: [
+        { type: 'text', text: '<path>/tmp/image.webp</path>' },
+        imgBlock,
+      ],
+    },
+  ], readImage)
+  assert.ok(promptBlocks.some(b => b.type === 'image' && b.data === fakeBase64 && b.mimeType === 'image/webp'))
+  assert.ok(!promptBlocks.some(b => b.type === 'text' && b.text.includes('[image sha256:')))
+
+  // 2. deliverResults forwards images from PTC follow-up user messages into MCP BridgeToolResult
+  const runtime = new AntigravityRuntime({
+    config: {
+      provider: 'antigravity',
+      displayName: 'Antigravity',
+      command: '',
+      home: '',
+      accounts: [],
+      contextWindow: 0,
+      defaultEffort: 'high',
+      autoPatch: false,
+      patchScript: '',
+      maxLiveSessions: 4,
+      idleSessionTtlMs: 600_000,
+      parkSettleMs: 50,
+      keepAliveMs: 1_000,
+      longDecodeContinuations: 3,
+      warmup: false,
+      quotaTtlMs: 60_000,
+      engineMode: 'safe-bridge',
+      circuitBreakerOn429: true,
+    },
+    spawnAcp: () => { throw new Error('unused') },
+    runCommand: async () => ({ code: 0, stdout: '', stderr: '' }),
+    readImage,
+    canReadImages: () => true,
+    log: { info: () => undefined, warn: () => undefined },
+    onModelsChanged: () => undefined,
+  })
+  try {
+    const turn = new AcpTurn('ptcimg01', false)
+    let resolvedResult = null
+    turn.pendingCalls.set('call-ptc-1', {
+      id: 'call-ptc-1',
+      name: 'run_code',
+      argumentsJson: '{}',
+      result: { resolve: value => { resolvedResult = value }, reject: () => undefined },
+    })
+    const conv = {
+      turn,
+      engineMode: 'safe-bridge',
+      advertisedToolNames: new Set(['run_code']),
+      knownTools: new Map([['run_code', 'h']]),
+      reportedToolCalls: new Map(),
+    }
+    const messages = [
+      {
+        id: 't-1',
+        role: 'tool',
+        toolCallId: 'call-ptc-1',
+        content: [{ type: 'text', text: '{"path":"/Users/raphael/Downloads/image.webp"}' }],
+      },
+      {
+        id: 'u-ptc-1',
+        role: 'user',
+        content: [
+          { type: 'text', text: '<path>/Users/raphael/Downloads/image.webp</path>\n<type>image</type>' },
+          imgBlock,
+        ],
+      },
+    ]
+    const delivered = await runtime.deliverResults(conv, { layout: { geminiDir: '/tmp' } }, messages, {}, [])
+    assert.equal(delivered, true)
+    assert.ok(resolvedResult !== null)
+    const imageItems = resolvedResult.content.filter(item => item.type === 'image')
+    assert.equal(imageItems.length, 1, 'MCP tool result must carry the resolved image block')
+    assert.deepEqual(imageItems[0], { type: 'image', data: fakeBase64, mimeType: 'image/webp' })
+    const allText = resolvedResult.content.filter(item => item.type === 'text').map(item => item.text).join('\n')
+    assert.ok(!allText.includes('[image sha256:'), 'must not leak [image sha256:...] placeholder text when image was resolved')
+    assert.ok(allText.includes('/Users/raphael/Downloads/image.webp'))
+  } finally {
+    await runtime.dispose()
   }
 })

@@ -2215,27 +2215,74 @@ export class AntigravityRuntime {
     const nonPureExtras = extras.filter(
       m => !(m.role === 'developer' && m.content.length > 0 && m.content.every(b => b.type === 'tool-addition' || b.type === 'tool-removal')),
     )
-    const extraText = nonPureExtras.length > 0 ? renderTranscript(nonPureExtras) : ''
+    const extraResolved = await this.resolveMessageImages(nonPureExtras)
     const toolDelta = consumeToolDelta(conv, tools)
-    const suffix = [toolDelta, extraText].filter(Boolean).join('\n\n')
+    const suffix = [toolDelta, extraResolved.text].filter(Boolean).join('\n\n')
     const pending = [...turn.pendingCalls.values()]
     turn.pendingCalls.clear()
     if (turn.finished || !this.isTurnLive(turn)) {
-      const transcript = renderTranscript(pending.map(call => results.get(call.id) as RequestMessage))
+      const pendingResolved = await this.resolveMessageImages(pending.map(call => results.get(call.id) as RequestMessage))
       conv.reportedToolCalls.clear()
       conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native')
       if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
-      this.startPrompt(conv, proc, [{ type: 'text', text: `${transcript}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.` }])
+      const fallbackText = `${pendingResolved.text}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.`
+      this.startPrompt(conv, proc, [
+        { type: 'text', text: fallbackText },
+        ...pendingResolved.images,
+        ...extraResolved.images,
+      ])
       return true
     }
     for (const [index, call] of pending.entries()) {
       const message = results.get(call.id) as Extract<RequestMessage, { role: 'tool' }>
-      const tail = index === pending.length - 1 && suffix.length > 0 ? `\n\n${suffix}` : ''
+      const isLast = index === pending.length - 1
+      const tail = isLast && suffix.length > 0 ? `\n\n${suffix}` : ''
       const result = await this.toBridgeResult(call.name, message.content, message.isError === true, Buffer.byteLength(tail, 'utf8'))
       if (tail.length > 0) result.content.push({ type: 'text', text: tail })
+      if (isLast && extraResolved.images.length > 0) result.content.push(...extraResolved.images)
       call.result.resolve(result)
     }
     return true
+  }
+
+  /**
+   * Render follow-up or fallback messages while preserving inline image blocks
+   * (e.g., DSH PTC `read_image` follow-up `user` messages) as real multimodal
+   * image items instead of flattening them into `[image sha256:...]` placeholders.
+   */
+  private async resolveMessageImages(
+    messages: readonly RequestMessage[],
+  ): Promise<{ text: string; images: Array<{ type: 'image'; data: string; mimeType: string }> }> {
+    if (messages.length === 0) return { text: '', images: [] }
+    const images: Array<{ type: 'image'; data: string; mimeType: string }> = []
+    const textMessages: RequestMessage[] = []
+    const canRead = this.host.canReadImages()
+    for (const message of messages) {
+      if (message.role === 'user' || message.role === 'developer' || message.role === 'tool') {
+        const remaining: ContentBlock[] = []
+        for (const block of message.content) {
+          if (block.type === 'image' && block.offloaded !== true && canRead) {
+            const image = await this.host.readImage(block)
+            if (image !== undefined) {
+              images.push({ type: 'image', data: image.data, mimeType: image.mimeType })
+            } else {
+              remaining.push({ type: 'text', text: `[image ${block.attachment.attachmentId} unavailable]` })
+            }
+          } else {
+            remaining.push(block)
+          }
+        }
+        if (remaining.length > 0) {
+          textMessages.push({ ...message, content: remaining } as RequestMessage)
+        }
+      } else {
+        textMessages.push(message)
+      }
+    }
+    return {
+      text: textMessages.length > 0 ? renderTranscript(textMessages) : '',
+      images,
+    }
   }
 
   private isTurnLive(turn: AcpTurn): boolean {
