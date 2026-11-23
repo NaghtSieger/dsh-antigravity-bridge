@@ -41,7 +41,7 @@ function makeRuntime({ accounts = [], quotaAccounts = [], omitArgonAccounts = []
     accounts: accounts.map(entry => entry.profile),
     contextWindow: 0, defaultEffort: 'high', autoPatch: false, patchScript: join(home, 'missing.py'),
     maxLiveSessions: 16, idleSessionTtlMs: 600_000, parkSettleMs: 80, keepAliveMs: 1_000,
-    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000,
+    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, engineMode: 'bridge',
   }
   const runtime = new AntigravityRuntime({
     config,

@@ -63,13 +63,18 @@ export type DegradeAction = typeof DEGRADE_ACTIONS[number]
 
 /**
  * How the plugin runs the Antigravity ACP agent:
- * - `bridge`: launch `agy acp --agent dsh-bridge`, disabling built-in tools and
- *   identity so DSH owns the system prompt and every tool call.
+ * - `safe-bridge`: launch unmodified `agy acp` keeping official `systemInstruction`
+ *   100% untouched (never `excludeDefaultComponents: true`, never `systemPrompt.append`),
+ *   disable built-in tools via `_meta.antigravity.enabledTools: []` + `eagerMcpServers`,
+ *   and deliver neutralized workspace guidelines in the first user turn so DSH owns
+ *   100% of tool execution and approvals with minimal ban surface.
+ * - `bridge`: legacy mode launching `agy acp --agent dsh-bridge`, disabling built-in
+ *   tools and default components so DSH injects its system prompt via `systemPrompt.append`.
  * - `native`: launch `agy acp` with its native identity and built-in workspace
  *   tools (`read_file`, `edit_file`, `write_file`, `run_command`, etc.) in the
  *   session working directory, exposing non-overlapping DSH tools on MCP.
  */
-export const ENGINE_MODES = ['bridge', 'native'] as const
+export const ENGINE_MODES = ['safe-bridge', 'bridge', 'native'] as const
 /** One Antigravity ACP agent engine mode. */
 export type EngineMode = typeof ENGINE_MODES[number]
 
@@ -130,8 +135,10 @@ export interface Config {
   quotaTtlMs: number
   /** Intervention level of the Gemini 4 flagship (Argon / Carbon) route-health fingerprint; see {@link DEGRADE_ACTIONS}. */
   degradeAction: Volatile<DegradeAction>
-  /** Agent engine mode (`bridge` or `native`); see {@link ENGINE_MODES}. */
+  /** Agent engine mode (`safe-bridge`, `bridge`, or `native`); see {@link ENGINE_MODES}. */
   engineMode: Volatile<EngineMode>
+  /** Immediately cancel `agy`'s internal retry loop on attempt-1 upstream 429/403/TOS policy errors. */
+  circuitBreakerOn429?: Volatile<boolean>
 }
 
 function maybeVolatile<T>(schema: T): T {
@@ -175,7 +182,8 @@ export const Config: z<Config> = z.object({
   warmup: z.boolean().default(true),
   quotaTtlMs: z.number().step(1).min(5_000).default(120_000),
   degradeAction: maybeVolatile(z.union(DEGRADE_ACTIONS).default('truncation')),
-  engineMode: maybeVolatile(z.union(ENGINE_MODES).default('bridge')),
+  engineMode: maybeVolatile(z.union(ENGINE_MODES).default('safe-bridge')),
+  circuitBreakerOn429: maybeVolatile(z.boolean().default(true)),
   // The published schemastery declarations type `.volatile()` fields as plain values.
 }) as unknown as z<Config>
 

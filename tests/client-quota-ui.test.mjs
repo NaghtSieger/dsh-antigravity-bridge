@@ -821,7 +821,7 @@ test('SettingsCard renders live settings as value rows that apply the chosen opt
     '默认思考High',
     '超长续写3 段',
     '降智处理128K截断重答',
-    '引擎模式DSH 工具桥接',
+    '引擎模式传统 DSH 工具桥接',
   ])
   assert.equal(rows.every((row) => row.props.disabled === false), true)
   const hint = (row) => findOne(row, (node) => node.props && node.props.className === 'dsh-agy-hint')
@@ -1028,12 +1028,12 @@ test('SettingsCard keeps its four choice rows mutually exclusive', async () => {
   assert.equal(expandedRows()[3].props['aria-expanded'], true)
   assert.deepEqual(choices().map(textOf), ['128K截断重答', '全量降智拦截重答', '仅监测提示'])
 
-  // Click "引擎模式" -> the degrade panel folds away, only the 2 engine modes show.
+  // Click "引擎模式" -> the degrade panel folds away, all 3 engine modes show.
   expandedRows()[4].props.onClick()
   await flush()
   assert.equal(expandedRows()[3].props['aria-expanded'], false)
   assert.equal(expandedRows()[4].props['aria-expanded'], true)
-  assert.deepEqual(choices().map(textOf), ['DSH 工具桥接', '原生 Agent（满血）'])
+  assert.deepEqual(choices().map(textOf), ['安全 DSH 桥接（推荐）', '传统 DSH 工具桥接', '原生 Agent（满血）'])
 
   view.unmount()
 })
@@ -1048,7 +1048,7 @@ test('SettingsCard switches the degraded-route level and engine mode live throug
   const degradeRow = () => findAll(view.tree, (node) => node.props && node.props['aria-expanded'] !== undefined)[3]
   const engineRow = () => findAll(view.tree, (node) => node.props && node.props['aria-expanded'] !== undefined)[4]
   assert.equal(textOf(degradeRow()), 'Degraded routeRe-answer on 128K truncation')
-  assert.equal(textOf(engineRow()), 'Engine modeDSH tool bridge')
+  assert.equal(textOf(engineRow()), 'Engine modeLegacy DSH bridge')
   degradeRow().props.onClick()
   await flush()
   const options = findAll(view.tree, (node) => node.tag === 'button' && node.props['aria-checked'] !== undefined)
@@ -1062,9 +1062,9 @@ test('SettingsCard switches the degraded-route level and engine mode live throug
   engineRow().props.onClick()
   await flush()
   const engineChoices = findAll(view.tree, (node) => node.tag === 'button' && node.props['aria-checked'] !== undefined)
-  assert.deepEqual(engineChoices.map(textOf), ['DSH tool bridge', 'Native agent (full strength)'])
-  assert.equal(engineChoices[0].props['aria-checked'], true)
-  engineChoices[1].props.onClick()
+  assert.deepEqual(engineChoices.map(textOf), ['Safe DSH bridge (recommended)', 'Legacy DSH bridge', 'Native agent (full strength)'])
+  assert.equal(engineChoices[1].props['aria-checked'], true)
+  engineChoices[2].props.onClick()
   await flush()
   assert.deepEqual(JSON.parse(JSON.stringify(patches)), [{ degradeAction: 'observe' }, { engineMode: 'native' }])
   assert.equal(textOf(engineRow()), 'Engine modeNative agent (full strength)')
@@ -1105,7 +1105,7 @@ test('SettingsCard paints status with interactive choice rows while quota is sti
     '默认思考High',
     '超长续写3 段',
     '降智处理128K截断重答',
-    '引擎模式DSH 工具桥接',
+    '引擎模式安全 DSH 桥接（推荐）',
   ])
   assert.equal(rows.every((row) => row.props.disabled === false), true,
     'a slow quota read must never disable or fade out the choice rows')

@@ -19,12 +19,16 @@ import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
 import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME, type NativeSandboxMode } from './history.ts'
 import { labeled } from './labels.ts'
 import type { StepUsageBatch, StepUsageSample } from './usage-db.ts'
-import { AsyncQueue, deferred, type Deferred } from './util.ts'
+import { AsyncQueue, customLlmError, deferred, type Deferred } from './util.ts'
 
 export { CALL_TOOL_NAME }
 
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
 const AGENT_RETRY_NOTICE = /^\s*⚠\s*(?:Error:\s*)?API error \(attempt \d+\)/i
+/** In-band upstream quota/policy/auth failure inside an `agy` retry notice that must trip the attempt-1 circuit breaker. */
+const AGENT_POLICY_FAILURE = /(?:RESOURCE_EXHAUSTED|TOS_VIOLATION|PERMISSION_DENIED|UNAUTHENTICATED|\bcode\s*(?:429|403|401)\b)/i
+/** Auth-specific failure inside an `agy` retry notice. */
+const AGENT_AUTH_FAILURE = /(?:UNAUTHENTICATED|\bcode\s*401\b)/i
 /** Prefix of `AGENT_RETRY_NOTICE` while its opening words arrive across chunks. */
 const AGENT_RETRY_PREFIX = /^\s*⚠\s*(?:e(?:r(?:r(?:o(?:r:?)?)?)?)?\s*)?(?:a(?:p(?:i(?:\s+e(?:r(?:r(?:o(?:r(?:\s*\((?:a(?:t(?:t(?:e(?:m(?:p(?:t(?:\s*\d*)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/i
 /** Lone warning prefix (`⚠` or `⚠ Error:`) before the notice body arrives. */
@@ -47,6 +51,7 @@ export type AgentNoticeVerdict =
   | { kind: 'hold' }
   | { kind: 'drop' }
   | { kind: 'error'; code: 'TRANSPORT' | 'RATE_LIMIT'; message: string }
+  | { kind: 'circuit-break'; code: 'QUOTA' | 'AUTH'; message: string }
 
 /** Collapse agy's warning mark and line breaks so the notice can be recognized across chunks. */
 function noticeText(raw: string): string {
@@ -106,7 +111,17 @@ export function classifyAgentNotice(raw: string, final = false): AgentNoticeVerd
   const outputLimit = classifyOutputLimitNotice(raw)
   if (outputLimit === 'drop') return { kind: 'drop' }
   if (outputLimit === 'hold') return final ? { kind: 'emit' } : { kind: 'hold' }
-  if (AGENT_RETRY_NOTICE.test(raw)) return { kind: 'drop' }
+  if (AGENT_RETRY_NOTICE.test(raw)) {
+    if (AGENT_POLICY_FAILURE.test(raw)) {
+      const code = AGENT_AUTH_FAILURE.test(raw) ? 'AUTH' : 'QUOTA'
+      return {
+        kind: 'circuit-break',
+        code,
+        message: `Antigravity upstream quota/policy rejection (circuit breaker tripped to prevent retry storm): ${raw.trim()}`,
+      }
+    }
+    return { kind: 'drop' }
+  }
   if (!final && (WARNING_PREFIX.test(raw) || AGENT_RETRY_PREFIX.test(raw.trim()))) {
     return { kind: 'hold' }
   }
@@ -185,7 +200,7 @@ export type TurnEvent =
  * @returns the tagged failure with the harness retry hint.
  */
 export function degradedRouteError(): LlmError {
-  return new LlmError(
+  return customLlmError(
     labeled('DEGRADED_ROUTE', '上游把这次回答分到了降级线路，已在原会话重新生成。'),
     'DEGRADED_ROUTE',
     { providerRetryAfterMs: 1_000 },
@@ -198,7 +213,7 @@ export function degradedRouteError(): LlmError {
  * @returns the terminal failure.
  */
 export function degradedExhaustedError(): LlmError {
-  return new LlmError(
+  return customLlmError(
     labeled('DEGRADED_ROUTE_EXHAUSTED', '上游连续把这次回答分到了降级线路；本次工具调用没有执行，请稍后重试。'),
     'DEGRADED_ROUTE_EXHAUSTED',
   )
@@ -282,8 +297,13 @@ export class AcpTurn {
   /**
    * @param turnTag - unique per-turn hex tag used in synthesized call ids (`agy_<turnTag>_<n>`).
    * @param nativeMode - whether to emit concise `[agy]` reasoning traces for built-in tool calls.
+   * @param onCircuitBreak - invoked immediately when an upstream 429/403/TOS policy error trips the attempt-1 circuit breaker.
    */
-  constructor(private readonly turnTag: string, private readonly nativeMode = false) {}
+  constructor(
+    private readonly turnTag: string,
+    private readonly nativeMode = false,
+    private readonly onCircuitBreak?: (error: LlmError) => void,
+  ) {}
 
   /**
    * Record one batch of per-step model usage read from the local session DB.
@@ -442,6 +462,16 @@ export class AcpTurn {
       this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
       return
     }
+    if (verdict.kind === 'circuit-break') {
+      this.retryNotices++
+      if (this.onCircuitBreak === undefined) return
+      const err = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
+      this.agentFailure = err
+      this.clearFirstResponseTimer()
+      this.onCircuitBreak(err)
+      this.events.push({ kind: 'error', error: err })
+      return
+    }
     if (combined.trim().length > 0) {
       this.clearFirstResponseTimer()
       this.agentFailure = undefined
@@ -467,6 +497,14 @@ export class AcpTurn {
     if (verdict.kind === 'error') {
       this.retryNotices++
       this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
+      return ''
+    }
+    if (verdict.kind === 'circuit-break') {
+      this.retryNotices++
+      if (this.onCircuitBreak === undefined) return ''
+      const err = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
+      this.agentFailure = err
+      this.onCircuitBreak(err)
       return ''
     }
     if (this.agentFailure !== undefined && WARNING_PREFIX.test(held)) {

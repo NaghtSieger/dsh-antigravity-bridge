@@ -462,6 +462,49 @@ export function renderFullToolContracts(tools: readonly ToolSchema[] | undefined
 }
 
 /**
+ * Matches third-party agent persona headers that must not be injected verbatim
+ * when keeping Antigravity's official `systemInstruction` untouched.
+ */
+const THIRD_PARTY_PERSONA_LINE_RE = /^You are (?:an AI agent powered by|DeepSeek Harness|a coding assistant for DeepSeek)[^\n]*\n?/gim
+
+/**
+ * Neutralized workspace guidelines delivered inside the initial user prompt in
+ * `engineMode: 'safe-bridge'`, leaving Antigravity's official `systemInstruction`
+ * 100% untouched (no `excludeDefaultComponents`, no `systemPrompt.append`).
+ * @param rawSystem - DSH system prompt text.
+ * @param toolSignatures - optional concise parameter signatures for active DSH tools.
+ * @param hasTools - whether workspace MCP tools are mounted for this session.
+ * @returns `<workspace_guidelines>` block, or `''` when empty.
+ */
+export function formatSafeBridgeGuidelines(
+  rawSystem: string,
+  toolSignatures?: string,
+  hasTools = false,
+): string {
+  const cleaned = rawSystem
+    .replace(THIRD_PARTY_PERSONA_LINE_RE, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  const sections: string[] = []
+  if (hasTools) {
+    sections.push([
+      `Active workspace tools are mounted on the \`${MCP_SERVER_NAME}\` MCP server (named \`${AGENT_TOOL_PREFIX}<tool>\` or \`${AGENT_TOOL_PREFIX}<session_suffix>_<tool>\` as advertised). Invoke them directly when file, command, or workspace actions are needed; the host executes them under its own approval policy.`,
+      `For a tool announced later, invoke \`${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME}\` (or its session-scoped variant) with \`{"name":"<tool>","arguments":{...}}\`.`,
+      'Respond directly or via the mounted workspace tools; do not try to write Antigravity artifacts under `brain/`.',
+      'Always use the exact parameter names declared by each mounted tool (e.g. `file_path`, not `path` or `AbsolutePath` or `CommandLine`).',
+    ].join('\n'))
+  }
+  if (toolSignatures !== undefined && toolSignatures.trim().length > 0) {
+    sections.push(toolSignatures.trim())
+  }
+  if (cleaned.length > 0) {
+    sections.push(cleaned)
+  }
+  if (sections.length === 0) return ''
+  return `<workspace_guidelines>\n${sections.join('\n\n')}\n</workspace_guidelines>`
+}
+
+/**
  * The bridge instructions appended to the agent's system prompt.
  * @param system - the DSH system prompt.
  * @returns the complete appended system text.

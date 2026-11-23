@@ -39,7 +39,7 @@ function makeRuntime(extra = {}) {
     accounts: [{ id: 'default', displayName: '', home: '', enabled: true, env: {}, contextWindow: 0, system: true, visibleModels: [], priority: 1, weight: 1 }],
     contextWindow: 0, defaultEffort: 'high', autoPatch: false, patchScript: join(home, 'missing.py'),
     maxLiveSessions: 16, idleSessionTtlMs: 600_000, parkSettleMs: 80, keepAliveMs: 1_000,
-    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, ...extra.config,
+    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, engineMode: 'bridge', ...extra.config,
   }
   const runtime = new AntigravityRuntime({
     config,
@@ -1405,7 +1405,7 @@ test('session-index.json resumes ACP sessions via native session/load across cap
       accounts: [{ id: 'default', displayName: '', home: '', enabled: true, env: {}, contextWindow: 0, system: true, visibleModels: [], priority: 1, weight: 1 }],
       contextWindow: 0, defaultEffort: 'high', autoPatch: false, patchScript: join(first.home, 'missing.py'),
       maxLiveSessions: 16, idleSessionTtlMs: 600_000, parkSettleMs: 80, keepAliveMs: 1_000,
-      longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000,
+      longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, engineMode: 'bridge',
     },
     spawnAcp: (argv, cwd) => {
       const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], { cwd, env: { ...process.env, FAKE_AGY_LOG: log2, FAKE_AGY_MCP: mcp2 }, stdio: ['pipe', 'pipe', 'pipe'] })

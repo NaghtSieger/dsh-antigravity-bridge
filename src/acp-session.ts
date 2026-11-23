@@ -13,7 +13,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import type { RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { RequestMessage, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { AcpConfigOption, AcpPermissionOutcome, AcpPermissionRequest, AcpProcess, AcpSessionListener } from './acp-process.ts'
 import type { Effort, EngineMode } from './config.ts'
 import type { AcpTurn } from './conversation.ts'
@@ -22,7 +22,7 @@ import { labeled } from './labels.ts'
 import type { BridgeTool } from './mcp-bridge.ts'
 import type { RouteHealth } from './route-health.ts'
 import { recordReportedToolCall, type PermissionGateState, type ReportedToolCall } from './tool-bridge.ts'
-import { digest } from './util.ts'
+import { customLlmError, digest } from './util.ts'
 
 /** Purpose of the conversation serving the user-visible turn rather than an auxiliary call. */
 export const MAIN_PURPOSE = 'main'
@@ -54,6 +54,8 @@ export interface Conversation {
   advertisedToolNames: Set<string>
   knownTools: Map<string, string>
   toolNames: Set<string>
+  /** Active DSH tool schemas indexed by canonical tool name (used for argument sanitization and required-key validation). */
+  activeToolSchemas: Map<string, ToolSchema>
   /** Tool calls the agent reported via `session/update` — the only trusted permission source. */
   reportedToolCalls: Map<string, ReportedToolCall>
   /** True while this conversation is being acquired or its session is opening; never evicted as idle. */
@@ -127,7 +129,7 @@ export function permissionState(conv: Conversation): PermissionGateState {
     sessionId: conv.sessionId,
     tenantKey: conv.tenantKey,
     turnLive: conv.turn !== undefined && !conv.turn.finished,
-    engineMode: conv.engineMode ?? 'bridge',
+    engineMode: conv.engineMode ?? 'safe-bridge',
     sandboxMode: conv.sandboxMode,
     sessionCwd: conv.sessionCwd,
     writableRoots: conv.writableRoots,
@@ -276,10 +278,12 @@ export function mountBridge(conv: Conversation, port: BridgeMountPort): BridgeMo
     },
     onPermission: request => port.permission(request),
   }
-  const mode = port.engineMode ?? conv.engineMode ?? 'bridge'
-  const systemAppend = mode === 'native'
-    ? nativeBridgeSystemPrompt(port.system, port.toolContracts, conv.sessionCwd)
-    : bridgeSystemPrompt(port.system)
+  const mode = port.engineMode ?? conv.engineMode ?? 'safe-bridge'
+  const systemAppend = mode === 'safe-bridge'
+    ? ''
+    : mode === 'native'
+      ? nativeBridgeSystemPrompt(port.system, port.toolContracts, conv.sessionCwd)
+      : bridgeSystemPrompt(port.system)
   return { mcpServers, systemAppend, listener }
 }
 
@@ -349,7 +353,7 @@ async function confirmConfigOption(
     if (option?.id !== undefined) id = option.id
   }
   const actual = option?.currentValue === undefined ? 'undefined' : option.currentValue
-  throw new LlmError(
+  throw customLlmError(
     labeled('INVALID_MODEL_CONFIG', `Antigravity kept ${kind} at "${actual}" after switching to "${target}"`),
     'INVALID_MODEL_CONFIG',
   )

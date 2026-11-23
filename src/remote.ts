@@ -208,6 +208,10 @@ export function parseConfigureRequest(value: unknown): LiveOverrides {
     if (mode === undefined) throw new TypeError('Invalid antigravity engineMode')
     out.engineMode = mode
   }
+  if (record.circuitBreakerOn429 !== undefined) {
+    if (typeof record.circuitBreakerOn429 !== 'boolean') throw new TypeError('Invalid antigravity circuitBreakerOn429')
+    out.circuitBreakerOn429 = record.circuitBreakerOn429
+  }
   if (record.hiddenModels !== undefined) out.hiddenModels = parseVisibleModels(record.hiddenModels, 'Invalid antigravity configure request.hiddenModels')
   if (record.visibleModels !== undefined) out.visibleModels = parseVisibleModels(record.visibleModels, 'Invalid antigravity configure request.visibleModels')
   return out

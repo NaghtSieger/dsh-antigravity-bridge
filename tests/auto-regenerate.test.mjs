@@ -44,7 +44,7 @@ function makeRuntime({ config: configExtra = {}, host = {}, plan, env: envExtra 
     // These tests pin the re-answer machinery itself, so they opt into the
     // intervention level that refuses on any degraded verdict; the default
     // level is pinned in degrade-policy.test.mjs.
-    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, degradeAction: 'legacy', ...configExtra,
+    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, degradeAction: 'legacy', engineMode: 'bridge', ...configExtra,
   }
   const runtime = new AntigravityRuntime({
     config,

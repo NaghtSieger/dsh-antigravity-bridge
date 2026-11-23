@@ -48,7 +48,7 @@ function makeRuntime({ accounts = [], quotaAccounts = [], ratelimitAccounts = []
     accounts: accounts.map(entry => entry.profile),
     contextWindow: 0, defaultEffort: 'high', autoPatch: false, patchScript: join(home, 'missing.py'),
     maxLiveSessions: 16, idleSessionTtlMs: 600_000, parkSettleMs: 80, keepAliveMs: 1_000,
-    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000,
+    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, engineMode: 'bridge',
     ...degradeAction === undefined ? {} : { degradeAction },
   }
   const runtime = new AntigravityRuntime({

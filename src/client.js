@@ -1757,9 +1757,10 @@ window.__ModuleLoader__.load({
       { value: 'observe', label: t('Observe only', '仅监测提示') },
     ]
 
-    /** ACP agent engine modes: DSH tool bridge vs native Antigravity agent with non-overlapping MCP tools. */
+    /** ACP agent engine modes: TOS-safe DSH tool bridge (default), legacy bridge, or native Antigravity agent. */
     const engineOptions = () => [
-      { value: 'bridge', label: t('DSH tool bridge', 'DSH 工具桥接') },
+      { value: 'safe-bridge', label: t('Safe DSH bridge (recommended)', '安全 DSH 桥接（推荐）') },
+      { value: 'bridge', label: t('Legacy DSH bridge', '传统 DSH 工具桥接') },
       { value: 'native', label: t('Native agent (full strength)', '原生 Agent（满血）') },
     ]
 
@@ -1989,11 +1990,11 @@ window.__ModuleLoader__.load({
             h(ChoiceRow, {
               label: t('Engine mode', '引擎模式'),
               hint: t(
-                'Who reads files, edits them, and runs commands.\nBridge: the model thinks and DSH does that work.\nNative: Antigravity’s own tools do that work, while subagents, skills, and todos stay with DSH.',
-                '谁来读文件、改文件、跑命令。\nDSH 工具桥接：模型只负责想，这些活由 DSH 来做。\n原生 Agent（满血）：这些活由 Antigravity 自己的工具来做，子代理、技能、待办仍由 DSH 提供。',
+                'Who reads files, edits them, and runs commands.\nSafe DSH bridge (recommended): keeps official systemInstruction untouched, disables built-in tools via ACP metadata, and routes 100% of tools through DSH.\nLegacy bridge: injects DSH systemPrompt via a custom bridge agent.\nNative: Antigravity’s own tools do that work, while subagents, skills, and todos stay with DSH.',
+                '谁来读文件、改文件、跑命令。\n安全 DSH 桥接（推荐）：完整保留官方 systemInstruction 不篡改，通过 ACP 元数据关闭内置工具，100% 由 DSH 审批与执行工具。\n传统 DSH 工具桥接：使用自定义去皮 agent 注入系统提示词。\n原生 Agent（满血）：文件与命令由 Antigravity 自己执行，子代理、技能、待办仍由 DSH 提供。',
               ),
               options: engineOptions(),
-              value: status.engineMode || 'bridge',
+              value: status.engineMode || 'safe-bridge',
               disabled: busy,
               open: openKey === 'engine',
               onToggle: (next) => setOpenKey(next ? 'engine' : null),

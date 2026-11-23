@@ -62,6 +62,28 @@ export interface PreflightResult {
   unlock: UnlockState
 }
 
+/** Environment variables stripped from spawned `agy` child processes to prevent ambient API keys from overriding subscription OAuth. */
+export const STRIPPED_AUTH_ENV_KEYS = [
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'AGY_ADC_AUTH',
+  'DSH_AGY_LOCAL_KEY',
+] as const
+
+/**
+ * Strip ambient API-key / ADC environment variables from a child-process overlay
+ * so `agy` always uses subscription OAuth rather than accidental pay-per-token billing.
+ * @param env - base or overlay environment map.
+ * @returns a sanitized copy with stripped keys set to `undefined` so inherited values are cleared.
+ */
+export function sanitizeChildEnv(env?: Readonly<NodeJS.ProcessEnv>): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...(env ?? {}) }
+  for (const key of STRIPPED_AUTH_ENV_KEYS) {
+    out[key] = undefined
+  }
+  return out
+}
+
 /** Platform and environment overrides for executable discovery tests. */
 export interface ResolveBinaryOptions {
   platform?: NodeJS.Platform
@@ -105,6 +127,17 @@ export function resolveAgyBinary(configured: string, options: ResolveBinaryOptio
     candidates.push(join(home, '.local', 'bin', 'agy.exe'))
   } else {
     candidates.push(join(home, '.local', 'bin', 'agy'))
+    candidates.push(join(home, '.antigravity', 'bin', 'agy'))
+    if (platform === 'darwin') {
+      candidates.push(
+        '/Applications/Antigravity.app/Contents/Resources/app/bin/agy',
+        join(home, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin', 'agy'),
+        '/opt/homebrew/bin/agy',
+        '/usr/local/bin/agy',
+      )
+    } else if (platform === 'linux') {
+      candidates.push('/usr/local/bin/agy', '/usr/bin/agy')
+    }
   }
   for (const dir of splitPathDirs(env, platform)) {
     candidates.push(join(dir, exeName))

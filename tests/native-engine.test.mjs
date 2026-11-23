@@ -202,10 +202,12 @@ const reasoningOf = chunks => chunks.filter(c => c.type === 'reasoning-delta').m
 const callsOf = chunks => chunks.filter(c => c.type === 'block-end' && c.block.type === 'tool-call').map(c => c.block)
 const assistantFrom = (id, chunks, model) => assistant(id, chunks.filter(c => c.type === 'block-end').map(c => c.block), model)
 
-test('Config schema defaults engineMode to bridge and validates ENGINE_MODES', () => {
-  assert.deepEqual(ENGINE_MODES, ['bridge', 'native'])
-  assert.equal(current(Config({}).engineMode), 'bridge')
+test('Config schema defaults engineMode to safe-bridge and validates ENGINE_MODES', () => {
+  assert.deepEqual(ENGINE_MODES, ['safe-bridge', 'bridge', 'native'])
+  assert.equal(current(Config({}).engineMode), 'safe-bridge')
+  assert.equal(current(Config({ engineMode: 'bridge' }).engineMode), 'bridge')
   assert.equal(current(Config({ engineMode: 'native' }).engineMode), 'native')
+  assert.equal(asEngineMode('safe-bridge'), 'safe-bridge')
   assert.equal(asEngineMode('bridge'), 'bridge')
   assert.equal(asEngineMode('native'), 'native')
   assert.equal(asEngineMode('other'), undefined)

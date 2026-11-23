@@ -36,7 +36,7 @@ import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type Avai
 import { asDegradeAction, asEffort, asEngineMode, current, EFFORTS, type AccountProfile, type Config, type DegradeAction, type Effort, type EngineMode } from './config.ts'
 import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
 import {
-  AGENT_TOOL_PREFIX, BRIDGE_TEXT_BYTES, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, prepareNativeRequest, splitReplay,
+  BRIDGE_TEXT_BYTES, formatSafeBridgeGuidelines, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, MCP_SERVER_NAME, prepareNativeRequest, splitReplay,
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
   type AcpPromptBlock, type ImageResolver, type NativeSandboxMode, type NativeSessionContext,
 } from './history.ts'
@@ -54,7 +54,8 @@ import { SessionStore } from './session-store.ts'
 import { newSlot, rebaseSlot, slotDeniesModel, slotDisablesModel, type AccountSlot } from './slots.ts'
 import {
   answerPermission as decidePermission, boundBridgeContent, consumeToolDelta, filterToolsForEngineMode,
-  MAX_EAGER_BRIDGE_TOOL_BYTES, resolveActiveToolSchemas, toBridgeTools,
+  MAX_EAGER_BRIDGE_TOOL_BYTES, renderToolSignatures, resolveActiveToolSchemas, sanitizeMcpToolArguments,
+  stripAgentToolPrefix, toBridgeTools, validateRequiredToolArguments,
 } from './tool-bridge.ts'
 import {
   hasGenMetadata, isGemini4Flagship, peekMaxGenMetadataIdx, peekMaxModelStepIdx,
@@ -118,8 +119,10 @@ export interface LiveOverrides {
   longDecodeContinuations?: number
   /** Route-health intervention level for Gemini 4 flagship steps; see {@link DegradeAction}. */
   degradeAction?: DegradeAction
-  /** ACP agent engine mode (`bridge` or `native`); see {@link EngineMode}. */
+  /** ACP agent engine mode (`safe-bridge`, `bridge`, or `native`); see {@link EngineMode}. */
   engineMode?: EngineMode
+  /** Immediately cancel `agy`'s internal retry loop on attempt-1 upstream 429/403/TOS policy errors. */
+  circuitBreakerOn429?: boolean
   /**
    * Replace the whole account list, the machine account included as its
    * `system: true` entry. A list without one means the machine account was
@@ -157,8 +160,10 @@ export interface RuntimeStatus {
   longDecodeContinuations: number
   /** Live route-health intervention level. */
   degradeAction: DegradeAction
-  /** Live ACP agent engine mode (`bridge` or `native`). */
+  /** Live ACP agent engine mode (`safe-bridge`, `bridge`, or `native`). */
   engineMode: EngineMode
+  /** Whether attempt-1 upstream 429/403/TOS policy errors immediately trip the circuit breaker. */
+  circuitBreakerOn429: boolean
   models: { id: string; name: string }[]
   /** Every advertised family with the visibility the current allowlist gives it. */
   availableModels: { id: string; name: string; enabled: boolean }[]
@@ -256,7 +261,7 @@ export class AntigravityRuntime {
     this.sessions.save(conv.dshSessionId, {
       acpSessionId: conv.sessionId,
       accountId: conv.accountId,
-      engineMode: conv.engineMode ?? 'bridge',
+      engineMode: conv.engineMode ?? this.engineMode(),
       ...(conv.sessionCwd !== undefined ? { sessionCwd: conv.sessionCwd } : {}),
       systemHash: conv.systemHash,
       knownIds: [...conv.knownIds],
@@ -317,7 +322,7 @@ export class AntigravityRuntime {
   private baseContextWindow(model: string): number {
     const window = this.contextWindow()
     const discovered = this.catalog.maxTokensFor(model)
-    if (this.engineMode() === 'bridge' && discovered !== undefined && discovered > 0) return Math.min(window, discovered)
+    if ((this.engineMode() === 'bridge' || this.engineMode() === 'safe-bridge') && discovered !== undefined && discovered > 0) return Math.min(window, discovered)
     if (this.configuredContextWindow() > 0) return window
     if (model.startsWith('gpt-oss')) return GPT_OSS_CONTEXT_WINDOW
     return discovered !== undefined && discovered > 0 ? Math.min(discovered, window) : window
@@ -364,13 +369,24 @@ export class AntigravityRuntime {
 
   /**
    * Active ACP agent engine mode: the settings-card override, then the volatile
-   * config field, then `bridge`.
+   * config field, then `safe-bridge`.
    * @returns the active engine mode.
    */
   engineMode(): EngineMode {
     return this.overrides.engineMode
       ?? asEngineMode(current((this.host.config as { engineMode?: unknown }).engineMode))
-      ?? 'bridge'
+      ?? 'safe-bridge'
+  }
+
+  /**
+   * Whether attempt-1 upstream 429/403/TOS errors immediately cancel `agy`'s
+   * internal retry loop to prevent retry storms.
+   * @returns true when the circuit breaker is enabled.
+   */
+  circuitBreakerOn429(): boolean {
+    if (typeof this.overrides.circuitBreakerOn429 === 'boolean') return this.overrides.circuitBreakerOn429
+    const configured = current((this.host.config as { circuitBreakerOn429?: unknown }).circuitBreakerOn429)
+    return typeof configured === 'boolean' ? configured : true
   }
 
   private providerHidden(): string[] {
@@ -604,6 +620,7 @@ export class AntigravityRuntime {
       longDecodeContinuations: this.longDecodeContinuations(),
       degradeAction: this.degradeAction(),
       engineMode: this.engineMode(),
+      circuitBreakerOn429: this.circuitBreakerOn429(),
       models: this.catalog.list().map(m => ({ ...m })),
       availableModels: this.catalog.availableModels().map(m => ({ ...m })),
       visibleModels: this.providerVisible(),
@@ -1206,6 +1223,7 @@ export class AntigravityRuntime {
     const activeSchemas = resolveActiveToolSchemas(filteredTools, preparedMessages)
     const tools = toBridgeTools(activeSchemas, engineMode)
     conv.toolNames = new Set(tools.map(t => t.name))
+    conv.activeToolSchemas = new Map(activeSchemas.map(s => [s.name, s]))
     conv.sandboxMode = sandboxMode
     conv.writableRoots = writableRoots
     const effort = this.effectiveEffort(options.model, asEffort(options.reasoningEffort) ?? this.defaultEffort())
@@ -1270,9 +1288,20 @@ export class AntigravityRuntime {
       if (toolDelta.length > 0) blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
     }
     const nextKnownIds = messageIds(preparedMessages)
-    const finalBlocks = await this.handoff(conv, proc, blocks, plan.rebuild && plan.history.length > 0, options.signal)
+    const guidelinesBlock = engineMode === 'safe-bridge' && freshSession
+      ? this.safeBridgeGuidelinesBlock(systemText, activeSchemas)
+      : undefined
+    const reservedBytes = guidelinesBlock !== undefined ? Buffer.byteLength(guidelinesBlock.text, 'utf8') : 0
+    const handoffBlocks = await this.handoff(conv, proc, blocks, plan.rebuild && plan.history.length > 0, options.signal, reservedBytes)
+    const finalBlocks = guidelinesBlock !== undefined ? [guidelinesBlock, ...handoffBlocks] : [...handoffBlocks]
     conv.reportedToolCalls.clear()
-    conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native')
+    const onCircuitBreak = this.circuitBreakerOn429()
+      ? (error: LlmError): void => {
+          this.host.log.warn(`antigravity-acp: circuit breaker tripped on ${conv.key}: ${error.message}`)
+          if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
+        }
+      : undefined
+    conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native', onCircuitBreak)
     conv.health.beginTurn()
     // Record the request this prompt belongs to; a rebuild above (which
     // replaced the whole bookkeeping object) already cleared it.
@@ -1284,7 +1313,7 @@ export class AntigravityRuntime {
     if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
-    const waitForFirstResponse = engineMode === 'bridge' && plan.input.some(message => message.role === 'user')
+    const waitForFirstResponse = (engineMode === 'bridge' || engineMode === 'safe-bridge') && plan.input.some(message => message.role === 'user')
     this.startPrompt(conv, proc, finalBlocks, waitForFirstResponse, options.signal)
     yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds })
   }
@@ -1373,8 +1402,19 @@ export class AntigravityRuntime {
     conv.sandboxMode = sandboxMode
     conv.writableRoots = writableRoots
     const hasHistory = fresh && planPrompt(conv, system, messages, this.host.config.provider).history.length > 0
-    const finalBlocks = await this.handoff(conv, proc, blocks, hasHistory, options.signal)
-    conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native')
+    const guidelinesBlock = engineMode === 'safe-bridge' && fresh
+      ? this.safeBridgeGuidelinesBlock(`[reanswer:${conv.tag}:${state.granted}]\n\n${system}`, activeSchemas)
+      : undefined
+    const reservedBytes = guidelinesBlock !== undefined ? Buffer.byteLength(guidelinesBlock.text, 'utf8') : 0
+    const handoffBlocks = await this.handoff(conv, proc, blocks, hasHistory, options.signal, reservedBytes)
+    const finalBlocks = guidelinesBlock !== undefined ? [guidelinesBlock, ...handoffBlocks] : handoffBlocks
+    const onCircuitBreak = this.circuitBreakerOn429()
+      ? (error: LlmError): void => {
+          this.host.log.warn(`antigravity-acp: circuit breaker tripped during reanswer on ${conv.key}: ${error.message}`)
+          if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
+        }
+      : undefined
+    conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native', onCircuitBreak)
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
     this.startPrompt(conv, proc, finalBlocks)
@@ -1447,11 +1487,14 @@ export class AntigravityRuntime {
       warn: message => this.host.log.warn(message),
     })
     try {
+      const loadMeta = engineMode === 'safe-bridge'
+        ? { antigravity: { enabledTools: [] as string[], eagerMcpServers: mount.mcpServers.length > 0 ? [MCP_SERVER_NAME] : [] } }
+        : { antigravity: { systemPrompt: { append: mount.systemAppend } } }
       const result = await proc.loadSession({
         sessionId: persisted.acpSessionId,
         cwd: effectiveCwd,
         mcpServers: mount.mcpServers,
-        _meta: { antigravity: { systemPrompt: { append: mount.systemAppend } } },
+        _meta: loadMeta,
       }, mount.listener, 60_000)
       conv.sessionId = result.sessionId || persisted.acpSessionId
       conv.process = proc
@@ -1562,6 +1605,7 @@ export class AntigravityRuntime {
       advertisedToolNames: new Set(),
       knownTools: new Map(),
       toolNames: new Set(),
+      activeToolSchemas: new Map(),
       reportedToolCalls: new Map(),
       opening: false,
       usageSource: undefined,
@@ -1735,10 +1779,13 @@ export class AntigravityRuntime {
       warn: message => this.host.log.warn(message),
     })
     try {
+      const sessionMeta = engineMode === 'safe-bridge'
+        ? { antigravity: { enabledTools: [] as string[], eagerMcpServers: mount.mcpServers.length > 0 ? [MCP_SERVER_NAME] : [] } }
+        : { antigravity: { systemPrompt: { append: mount.systemAppend } } }
       const result = await proc.newSession({
         cwd: effectiveCwd,
         mcpServers: mount.mcpServers,
-        _meta: { antigravity: { systemPrompt: { append: mount.systemAppend } } },
+        _meta: sessionMeta,
       }, mount.listener, 120_000)
       conv.sessionId = result.sessionId
       conv.process = proc
@@ -1814,6 +1861,7 @@ export class AntigravityRuntime {
     conv.writableRoots = []
     conv.advertisedTools = []
     conv.advertisedToolNames.clear()
+    conv.activeToolSchemas.clear()
     conv.knownTools.clear()
     conv.reportedToolCalls.clear()
     this.resetUsageReading(conv)
@@ -1823,9 +1871,22 @@ export class AntigravityRuntime {
     conv.dirty = false
   }
 
-  private async handoff(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[], hasHistory: boolean, signal?: AbortSignal): Promise<AcpPromptBlock[]> {
-    if (conv.engineMode !== 'bridge' || !hasHistory) return blocks
-    const { parts, final } = splitReplay(blocks, true)
+  private safeBridgeGuidelinesBlock(systemText: string, activeSchemas: readonly ToolSchema[]): { type: 'text'; text: string } | undefined {
+    const guidelines = formatSafeBridgeGuidelines(systemText, renderToolSignatures(activeSchemas), activeSchemas.length > 0)
+    return guidelines.length > 0 ? { type: 'text', text: `${guidelines}\n\n` } : undefined
+  }
+
+  private async handoff(
+    conv: Conversation,
+    proc: AcpProcess,
+    blocks: AcpPromptBlock[],
+    hasHistory: boolean,
+    signal?: AbortSignal,
+    reservedBytes = 0,
+  ): Promise<AcpPromptBlock[]> {
+    if ((conv.engineMode !== 'bridge' && conv.engineMode !== 'safe-bridge') || !hasHistory) return blocks
+    const limit = Math.max(1_024, BRIDGE_TEXT_BYTES - reservedBytes)
+    const { parts, final } = splitReplay(blocks, true, limit)
     try {
       for (const part of parts) await proc.receiveHistory(conv.sessionId!, part, signal)
     } catch (error) {
@@ -1837,7 +1898,7 @@ export class AntigravityRuntime {
 
   private startPrompt(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[], waitForFirstResponse = false, signal?: AbortSignal): void {
     const turn = conv.turn as AcpTurn
-    if (conv.engineMode === 'bridge') {
+    if (conv.engineMode === 'bridge' || conv.engineMode === 'safe-bridge') {
       const bytes = blocks.reduce((sum, b) => sum + (b.type === 'text' ? Buffer.byteLength(b.text) : 0), 0)
       if (bytes > BRIDGE_TEXT_BYTES) {
         turn.events.push({ kind: 'error', error: new LlmError(
@@ -2380,25 +2441,35 @@ export class AntigravityRuntime {
     }
     if (request.name === CALL_TOOL_NAME) {
       const rawTarget = typeof request.arguments.name === 'string' ? request.arguments.name.trim() : ''
-      const targetName = rawTarget.startsWith(AGENT_TOOL_PREFIX) ? rawTarget.slice(AGENT_TOOL_PREFIX.length) : rawTarget
+      const targetName = stripAgentToolPrefix(rawTarget)
       const rawArgs = request.arguments.arguments
-      const targetArgs = rawArgs !== null && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
-        ? rawArgs as Record<string, unknown>
-        : {}
+      const schema = conv.activeToolSchemas?.get(targetName)
+      const targetArgs = sanitizeMcpToolArguments(rawArgs, schema)
       if (!conv.toolNames.has(targetName)) {
         return { content: [{ type: 'text', text: `The harness has no tool named ${targetName}.` }], isError: true }
+      }
+      const validationError = validateRequiredToolArguments(schema, targetArgs)
+      if (validationError !== undefined) {
+        return { content: [{ type: 'text', text: validationError }], isError: true }
       }
       const gated = await this.evaluateToolGate(conv, turn, request.signal)
       if (gated !== undefined) return gated
       const call = turn.park(targetName, targetArgs)
       return this.awaitCall(turn, call, request.signal)
     }
-    if (!conv.toolNames.has(request.name)) {
+    const canonicalName = conv.toolNames.has(request.name) ? request.name : stripAgentToolPrefix(request.name)
+    if (!conv.toolNames.has(canonicalName)) {
       return { content: [{ type: 'text', text: `The harness has no tool named ${request.name}.` }], isError: true }
+    }
+    const schema = conv.activeToolSchemas?.get(canonicalName)
+    const sanitizedArgs = sanitizeMcpToolArguments(request.arguments, schema)
+    const validationError = validateRequiredToolArguments(schema, sanitizedArgs)
+    if (validationError !== undefined) {
+      return { content: [{ type: 'text', text: validationError }], isError: true }
     }
     const gated = await this.evaluateToolGate(conv, turn, request.signal)
     if (gated !== undefined) return gated
-    const call = turn.park(request.name, request.arguments)
+    const call = turn.park(canonicalName, sanitizedArgs)
     return this.awaitCall(turn, call, request.signal)
   }
 

@@ -5,6 +5,7 @@
  */
 
 import { createHash } from 'node:crypto'
+import { LlmError, type LlmFailure } from '@deepseek-ai/dsh-llm'
 
 /** A promise with externally exposed settlement. */
 export interface Deferred<T> {
@@ -135,4 +136,25 @@ export function digest(value: unknown): string {
  */
 export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/**
+ * Construct an `LlmError` carrying a provider-specific custom failure code
+ * across both DSH `0.2.2-rc.3+` (`LlmError.fromFailure`) and earlier `0.2.x`
+ * hosts.
+ * @param message - human-readable failure summary.
+ * @param code - custom machine code (e.g. `DEGRADED_ROUTE`, `INVALID_MODEL_CONFIG`).
+ * @param extra - optional serializable failure facts such as `providerRetryAfterMs`.
+ * @returns the constructed `LlmError`.
+ */
+export function customLlmError(
+  message: string,
+  code: string,
+  extra?: Omit<LlmFailure, 'message' | 'code'>,
+): LlmError {
+  if (typeof LlmError.fromFailure === 'function') {
+    return LlmError.fromFailure({ message, code, ...extra })
+  }
+  const Ctor = LlmError as unknown as new (msg: string, c: string, opts?: Record<string, unknown>) => LlmError
+  return new Ctor(message, code, extra as Record<string, unknown> | undefined)
 }
