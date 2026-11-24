@@ -1,11 +1,11 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { AcpTurn } from '../lib/conversation.js'
+import { AcpTurn, pumpStep } from '../lib/conversation.js'
 import { AntigravityRuntime } from '../lib/runtime.js'
 
 
-function setup(t, watched = true) {
+function setup(t, watched = true, acknowledge = true) {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const turn = new AcpTurn('fixture')
   const conv = {
@@ -13,30 +13,64 @@ function setup(t, watched = true) {
     activeToolSchemas: new Map([['write', { name: 'write', parameters: { type: 'object', properties: {} } }]]),
   }
   const abort = new AbortController()
+  const prompts = []
   const cancelled = []
-  let finish
+  let finish, rejectPrompt
   const proc = {
-    prompt: () => new Promise(resolve => { finish = resolve }),
-    cancel: id => { cancelled.push(id); finish({ stopReason: 'cancelled' }) },
+    prompt: (id, blocks) => { prompts.push({ id, blocks }); return new Promise((resolve, reject) => { finish = resolve; rejectPrompt = reject }) },
+    cancel: id => { cancelled.push(id); if (acknowledge) finish({ stopReason: 'cancelled' }) },
   }
   const runtime = Object.create(AntigravityRuntime.prototype)
   runtime.startPrompt(conv, proc, [], watched, abort.signal)
-  return { turn, conv, abort, cancelled, runtime, finish, tick: ms => t.mock.timers.tick(ms) }
+  return { turn, conv, abort, cancelled, runtime, prompts, finish: result => finish(result), reject: error => rejectPrompt(error), tick: ms => t.mock.timers.tick(ms) }
 }
 
-test('only silence expires at 180 seconds and the late cancel result is discarded', async t => {
+test('five automatic retries share one session; sixth silence is terminal', async t => {
   const r = setup(t)
-  r.turn.onUpdate({ sessionUpdate: 'usage_update', used: 123 })
-  r.turn.onUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } })
-  r.tick(179999)
-  assert.deepEqual(r.cancelled, [])
-  r.tick(1)
-  await r.conv.promptSettled
-  assert.deepEqual(r.cancelled, ['fixture'])
-  assert.equal(r.turn.events.shift().error.code, 'TIMEOUT')
+  for (let attempt = 0; attempt <= 5; attempt++) {
+    r.turn.onUpdate({ sessionUpdate: 'usage_update', used: 123 })
+    r.tick(179999)
+    assert.equal(r.cancelled.length, attempt)
+    r.tick(1)
+    await Promise.resolve()
+    assert.equal(r.prompts.length, Math.min(attempt + 2, 6))
+  }
+  assert.equal(r.turn.events.shift().error.code, 'MODEL_IDLE')
+  assert.deepEqual(new Set(r.prompts.map(p => p.id)), new Set(['fixture']))
   assert.equal(r.turn.events.size, 0)
+})
+
+test('missing cancel acknowledgement stops without opening a second prompt', t => {
+  const r = setup(t, true, false)
+  r.tick(180000)
+  r.tick(180000)
+  const failure = r.turn.events.shift().error
+  assert.match(failure.message, /取消回执/)
+  assert.equal(r.prompts.length, 1)
+  assert.equal(r.cancelled.length, 1)
+})
+
+test('late permission activity while waiting for cancel acknowledgement does not disarm cancel watchdog', t => {
+  const r = setup(t, true, false)
+  r.runtime.host = { log: { warn() {} } }
   r.tick(180000)
   assert.equal(r.cancelled.length, 1)
+  r.tick(1000)
+  r.runtime.answerPermission(r.conv, { sessionId: 'fixture', options: [] })
+  r.tick(179000)
+  const failure = r.turn.events.shift().error
+  assert.equal(failure.code, 'MODEL_IDLE')
+  assert.match(failure.message, /取消回执/)
+  assert.equal(r.prompts.length, 1)
+})
+
+test('user abort while waiting for cancellation prevents automatic resumption', async t => {
+  const r = setup(t, true, false)
+  r.tick(180000)
+  r.abort.abort()
+  r.finish({ stopReason: 'cancelled' })
+  await r.conv.promptSettled
+  assert.equal(r.prompts.length, 1)
 })
 
 for (const event of [
@@ -47,12 +81,17 @@ for (const event of [
   { sessionUpdate: 'tool_call_update', toolCallId: '1', status: 'in_progress' },
   { sessionUpdate: 'plan', entries: [{ content: 'Read' }] },
 ]) {
-  test('progress at 179999 ms disarms timer: ' + (event.content?.type ?? '') + event.sessionUpdate, t => {
+  test('progress at 179999 ms restarts the idle deadline: ' + (event.content?.type ?? '') + event.sessionUpdate, async t => {
     const r = setup(t)
     r.tick(179999)
     r.turn.onUpdate(event)
-    r.tick(600001)
+    r.tick(179999)
     assert.deepEqual(r.cancelled, [])
+    r.tick(1)
+    assert.deepEqual(r.cancelled, ['fixture'])
+    await Promise.resolve()
+    assert.equal(r.prompts.length, 2)
+    assert.match(r.prompts[1].blocks[0].text, /Continue/)
   })
 }
 
@@ -71,13 +110,15 @@ test('DSH tool waiting for its result or approval across deadline is handed off 
   assert.equal(r.turn.calls.size, 1)
 })
 
-test('ACP permission activity without a preceding tool event also disarms timeout', t => {
+test('a synchronous ACP permission answer returns control to the model', t => {
   const r = setup(t)
   r.runtime.host = { log: { warn() {} } }
   r.tick(179999)
   r.runtime.answerPermission(r.conv, { sessionId: 'fixture', options: [] })
-  r.tick(600001)
+  r.tick(179999)
   assert.deepEqual(r.cancelled, [])
+  r.tick(1)
+  assert.deepEqual(r.cancelled, ['fixture'])
 })
 
 test('normal completion clears countdown', async t => {
@@ -104,13 +145,14 @@ test('unwatched tool continuation has no countdown', t => {
   assert.deepEqual(r.cancelled, [])
 })
 
-test('provider retry chatter alone still counts as silence', t => {
+test('provider retry chatter alone still counts as silence', async t => {
   const r = setup(t)
   r.tick(179999)
   r.turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '⚠ API error (attempt 1)' } })
   r.tick(1)
   assert.deepEqual(r.cancelled, ['fixture'])
-  assert.equal(r.turn.events.shift().error.code, 'TIMEOUT')
+  await Promise.resolve()
+  assert.equal(r.prompts.length, 2)
 })
 
 test('superseded generation cannot cancel a replacement', t => {
@@ -118,4 +160,104 @@ test('superseded generation cannot cancel a replacement', t => {
   r.conv.promptGen++
   r.tick(180000)
   assert.deepEqual(r.cancelled, [])
+})
+
+test('parallel DSH waits stay paused until both finish despite provider activity', async t => {
+  const r = setup(t)
+  const waits = []
+  const pending = [0, 1].map(() => r.turn.duringTool(() => new Promise(resolve => waits.push(resolve))))
+  waits[0]()
+  await pending[0]
+  r.turn.onUpdate({ sessionUpdate: 'plan', entries: [{ content: 'working' }] })
+  r.tick(600000)
+  assert.deepEqual(r.cancelled, [])
+  waits[1]()
+  await pending[1]
+  r.tick(179999)
+  r.turn.onUpdate({ sessionUpdate: 'usage_update', used: 100 })
+  r.tick(1)
+  assert.deepEqual(r.cancelled, ['fixture'])
+  await Promise.resolve()
+  assert.equal(r.prompts.length, 2)
+})
+
+test('a closed connection while cancelling cannot replay the request through host retries', async t => {
+  const r = setup(t, true, false)
+  r.tick(180000)
+  r.reject(new Error('transport disconnected'))
+  await r.conv.promptSettled
+  assert.equal(r.turn.events.shift().error.code, 'MODEL_IDLE')
+  assert.equal(r.prompts.length, 1)
+})
+
+test('an upstream 429 when cancellation is in flight retains the original error', async t => {
+  const r = setup(t, true, false)
+  r.tick(180000)
+  r.reject(new Error('HTTP 429, retry in 2s, request_id="idle-rate"'))
+  await r.conv.promptSettled
+  const error = r.turn.events.shift().error
+  assert.equal(error.code, 'UPSTREAM_429')
+  assert.equal(error.failure.requestId, 'idle-rate')
+  assert.equal(r.prompts.length, 1)
+})
+
+test('an upstream 403 policy rejection when cancellation is in flight retains PERMISSION_DENIED and requestId', async t => {
+  const r = setup(t, true, false)
+  r.tick(180000)
+  r.reject(new Error('403 TOS_VIOLATION: account restricted trace_id="idle-403"'))
+  await r.conv.promptSettled
+  const error = r.turn.events.shift().error
+  assert.equal(error.code, 'PERMISSION_DENIED')
+  assert.equal(error.failure.status, 403)
+  assert.equal(error.failure.requestId, 'idle-403')
+  assert.equal(r.turn.upstreamPolicyAborted, true)
+  assert.equal(r.prompts.length, 1)
+})
+
+test('split 403 notice arriving just before idle deadline preserves trailing requestId without premature idle trigger', t => {
+  const r = setup(t, true, false)
+  r.tick(179950)
+  r.turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '⚠ API error (attempt 1): 403 Forbidden' } })
+  r.tick(50)
+  r.turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' trace_id=tr-split-180s\n' } })
+  const error = r.turn.events.shift().error
+  assert.equal(error.code, 'PERMISSION_DENIED')
+  assert.equal(error.failure.status, 403)
+  assert.equal(error.failure.requestId, 'tr-split-180s')
+  assert.equal(r.prompts.length, 1)
+})
+
+test('max_tokens arriving while idle cancel is in flight reopens turn for continuation chunks and watchdog', async t => {
+  const r = setup(t, true, false)
+  r.tick(180000)
+  assert.equal(r.cancelled.length, 1)
+  assert.equal(r.turn.finished, true)
+  const chunks = []
+  const pumping = (async () => {
+    for await (const chunk of pumpStep(r.turn, {
+      parkSettleMs: 10,
+      maxContinuations: 2,
+      continuePrompt: () => r.runtime.startPrompt(r.conv, {
+        prompt: (id, blocks) => {
+          r.prompts.push({ id, blocks })
+          return new Promise(resolve => {
+            queueMicrotask(() => {
+              r.turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'continued text' } })
+              resolve({ stopReason: 'end_turn' })
+            })
+          })
+        },
+        cancel: id => r.cancelled.push(id),
+      }, [{ type: 'text', text: 'continue' }], true, r.abort.signal),
+      cancel: () => undefined,
+      recordUsage: () => undefined,
+    }, r.abort.signal)) {
+      chunks.push(chunk)
+    }
+  })()
+  r.finish({ stopReason: 'max_tokens' })
+  await pumping
+  const text = chunks.filter(c => c.type === 'text-delta').map(c => c.text).join('')
+  assert.equal(text, 'continued text')
+  assert.equal(r.prompts.length, 2)
 })

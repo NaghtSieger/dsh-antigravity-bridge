@@ -22,6 +22,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { LlmError, ProviderRequestId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { AcpProcess, type AcpConfigOption, type AcpPermissionOutcome, type AcpPermissionRequest, type AcpPromptResult, type AcpSpawner } from './acp-process.ts'
@@ -1410,7 +1411,7 @@ export class AntigravityRuntime {
     conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native')
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
-    this.startPrompt(conv, proc, finalBlocks)
+    this.startPrompt(conv, proc, finalBlocks, engineMode === 'bridge', options.signal)
     yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(messages) })
   }
 
@@ -1817,7 +1818,7 @@ export class AntigravityRuntime {
   }
 
   private answerPermission(conv: Conversation, request: AcpPermissionRequest): AcpPermissionOutcome {
-    conv.turn?.clearFirstResponseTimer()
+    conv.turn?.noteModelProgress()
     return decidePermission(permissionState(conv), request, {
       hasHandshake: tenantKey => this.bridge.hasHandshake(tenantKey),
       warn: message => this.host.log.warn(message),
@@ -1889,39 +1890,67 @@ export class AntigravityRuntime {
       }
     }
     const generation = ++conv.promptGen
+    turn.modelSignal = signal
     const sessionId = conv.sessionId as string
     let cancelled = false
+    let resumeAfterCancel = false
     const cancelOnce = () => {
-      if (cancelled || conv.turn !== turn || conv.promptGen !== generation || signal?.aborted) return
+      if (cancelled || conv.turn !== turn || conv.promptGen !== generation || turn.modelSignal?.aborted) return
       cancelled = true
       proc.cancel(sessionId)
     }
     const interrupt = (error: Error) => {
-      if (signal?.aborted || conv.turn !== turn || conv.promptGen !== generation) return
+      if (turn.modelSignal?.aborted || conv.turn !== turn || conv.promptGen !== generation) return
       cancelOnce()
       conv.promptGen++
       turn.finished = true
-      turn.clearFirstResponseTimer()
+      turn.stopWatching()
       turn.events.push({ kind: 'error', error })
     }
     turn.cancelRateRetry = cancelOnce
     turn.onRateRetry = message => interrupt(mapError(new Error(message)))
+    turn.onIdleInterrupt = error => interrupt(error)
     if (waitForFirstResponse) {
-      turn.waitForFirstResponse(() => interrupt(turn.agentFailure ?? new LlmError(labeled('TIMEOUT', 'No first response from Antigravity within 3 minutes'), 'TIMEOUT')))
+      turn.watchModel(() => {
+        if (turn.modelSignal?.aborted || conv.turn !== turn || conv.promptGen !== generation) return
+        if (turn.agentFailure) return interrupt(turn.agentFailure)
+        if (turn.idleRecovery.retries >= 5) return interrupt(idleError('已自动续接 5 次，模型仍连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。'))
+        resumeAfterCancel = true
+        turn.finished = true
+        turn.stopWatching()
+        cancelOnce()
+        // ACP 的取消是通知；旧 prompt 明确结束后才能在同一会话发送下一条。
+        turn.waitForFirstResponse(() => interrupt(idleError('未收到上次请求的取消回执，自动续接已暂停。')))
+      })
     }
     const p = proc.prompt(sessionId, blocks).then(
       (result) => {
-        if (conv.turn === turn && conv.promptGen === generation) turn.events.push({ kind: 'done', result })
+        if (conv.turn !== turn || conv.promptGen !== generation) return
+        if (resumeAfterCancel && result.stopReason === 'cancelled' && !turn.modelSignal?.aborted) {
+          turn.stopWatching()
+          turn.finished = false
+          turn.idleRecovery.retries++
+          turn.idleRecovery.beforeRetry = turn.idleRecovery.completed.length
+          const next = turn.modelStarted
+            ? [{ type: 'text' as const, text: 'Continue from where you stopped. Keep the existing answer and completed tool results; do not repeat completed actions.' }]
+            : blocks
+          this.startPrompt(conv, proc, next, true, turn.modelSignal)
+          return
+        }
+        turn.events.push({ kind: 'done', result })
       },
       (error: unknown) => {
         if (conv.turn !== turn || conv.promptGen !== generation) return
-        const failure = mapError(error)
+        let failure = mapError(error)
+        if (resumeAfterCancel && failure instanceof LlmError && ['TIMEOUT', 'TRANSPORT', 'SERVER'].includes(failure.code)) {
+          failure = idleError(`无法确认上次请求已取消，自动续接已暂停。${failure.message}`)
+        }
         if (failure instanceof LlmError && failure.failure.status === 429) turn.upstreamRateLimited = true
         else if (failure instanceof LlmError && (failure.failure.status === 401 || failure.failure.status === 403)) turn.upstreamPolicyAborted = true
         turn.events.push({ kind: 'error', error: failure })
       },
     )
-    conv.promptSettled = p.finally(() => turn.clearFirstResponseTimer())
+    conv.promptSettled = p.finally(() => { if (conv.promptGen === generation) turn.stopWatching() })
   }
 
   /**
@@ -2042,11 +2071,9 @@ export class AntigravityRuntime {
         parkSettleMs: this.host.config.parkSettleMs,
         maxContinuations: this.longDecodeContinuations(),
         holdZeroThoughtText,
-        continuePrompt: () => proc.prompt(conv.sessionId as string, [{ type: 'text', text: CONTINUE_PROMPT }]),
-        continueAfterPermissionDenial: denials => proc.prompt(
-          conv.sessionId as string,
-          [{ type: 'text', text: formatPermissionDenialContinuation(denials, conv.sessionCwd) }],
-        ),
+        continuePrompt: () => this.startPrompt(conv, proc, [{ type: 'text', text: CONTINUE_PROMPT }], conv.engineMode === 'bridge', options.signal),
+        continueAfterPermissionDenial: denials => this.startPrompt(conv, proc,
+          [{ type: 'text', text: formatPermissionDenialContinuation(denials, conv.sessionCwd) }], conv.engineMode === 'bridge', options.signal),
         cancel: () => {
           if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
         },
@@ -2155,6 +2182,13 @@ export class AntigravityRuntime {
         yield chunk
       }
     } catch (error) {
+      if (failureCode(error) === 'MODEL_IDLE') {
+        conv.reportedToolCalls.clear()
+        conv.turn = undefined
+        conv.knownIds = ctx.nextKnownIds
+        this.persistConversation(conv)
+        throw error
+      }
       if (isReanswerFailure(error)) {
         // A degraded step keeps its ACP session: only the answer was refused.
         // Nothing is persisted or forgotten, so the harness retry re-asks the
@@ -2172,7 +2206,7 @@ export class AntigravityRuntime {
       this.sessions.forget(conv.dshSessionId)
       throw mapError(error)
     } finally {
-      turn.clearFirstResponseTimer()
+      if (finishKind !== 'tool-calls') turn.stopWatching()
     }
     if (finishKind === 'tool-calls') {
       conv.knownIds = ctx.nextKnownIds
@@ -2214,6 +2248,10 @@ export class AntigravityRuntime {
     if (turn.upstreamRateLimited || turn.upstreamPolicyAborted) return true
 
     const toolDelta = consumeToolDelta(conv, tools)
+    if (conv.engineMode === 'bridge') {
+      for (const { call } of groups) turn.idleRecovery.completed.push({ name: call.name, argumentsJson: call.argumentsJson })
+    }
+    turn.modelSignal = signal
     const ended = turn.finished || !this.isTurnLive(turn)
     const continuation: AcpPromptBlock[] = []
     for (const [index, { call, message, extras }] of groups.entries()) {
@@ -2236,7 +2274,11 @@ export class AntigravityRuntime {
       conv.reportedToolCalls.clear()
       conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native')
       if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
-      this.startPrompt(conv, proc, blocks, false, signal)
+      conv.turn.idleRecovery = turn.idleRecovery
+      conv.turn.modelStarted = true
+      this.startPrompt(conv, proc, blocks, conv.engineMode === 'bridge', signal)
+    } else {
+      turn.resumeModel()
     }
     return true
   }
@@ -2467,7 +2509,6 @@ export class AntigravityRuntime {
     if (turn === undefined || turn.finished) {
       return { content: [{ type: 'text', text: 'No harness turn is waiting for this tool call.' }], isError: true }
     }
-    turn.clearFirstResponseTimer()
     const knownNames = new Set([...conv.toolNames, AWAIT_TOOL_NAME, CALL_TOOL_NAME, ...(conv.engineMode === 'bridge' ? [READ_TOOL_RESULT_NAME] : [])])
     const resolveName = (name: string): string => stripAgentToolPrefix(name, knownNames)
     const canonicalRequestName = resolveName(request.name)
@@ -2476,14 +2517,18 @@ export class AntigravityRuntime {
       let args = request.arguments.arguments
       if (typeof args === 'string') {
         try { args = JSON.parse(args) }
-        catch { return { content: [{ type: 'text', text: 'Expected a JSON object in arguments.' }], isError: true } }
+        catch {
+          turn.noteModelProgress()
+          return { content: [{ type: 'text', text: 'Expected a JSON object in arguments.' }], isError: true }
+        }
         if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+          turn.noteModelProgress()
           return { content: [{ type: 'text', text: 'Expected a JSON object in arguments.' }], isError: true }
         }
       }
-      return this.dispatchToolCall(conv, turn, resolveName(rawTarget), args, request.signal)
+      return turn.duringTool(() => this.dispatchToolCall(conv, turn, resolveName(rawTarget), args, request.signal))
     }
-    return this.dispatchToolCall(conv, turn, canonicalRequestName, request.arguments, request.signal)
+    return turn.duringTool(() => this.dispatchToolCall(conv, turn, canonicalRequestName, request.arguments, request.signal))
   }
 
   private async dispatchToolCall(
@@ -2508,6 +2553,16 @@ export class AntigravityRuntime {
     const schema = conv.activeToolSchemas.get(name)
     const validationError = validateRequiredToolArguments(schema, args)
     if (validationError !== undefined) return { content: [{ type: 'text', text: validationError }], isError: true }
+    const recovery = turn.idleRecovery
+    if (recovery.beforeRetry) {
+      const normalizedArgs = JSON.parse(JSON.stringify(args))
+      if (recovery.completed.some((call, index) =>
+        index < recovery.beforeRetry && call.name === name && isDeepStrictEqual(JSON.parse(call.argumentsJson), normalizedArgs))) {
+        const message = `自动续接请求再次执行已完成的工具 ${name}（参数相同）。请确认是否需要再执行一次。`
+        turn.onIdleInterrupt?.(idleError(message))
+        return { content: [{ type: 'text', text: message }], isError: true }
+      }
+    }
     const gated = await this.evaluateToolGate(conv, turn, signal)
     if (gated !== undefined) return gated
     const call = turn.park(name, args)
@@ -2717,6 +2772,10 @@ function describeVerdict(verdict: DegradeFingerprintResult): string {
 
 function reanswerKey(options: GenerateOptions, system: string): string {
   return `${String((options as { purpose?: string }).purpose ?? '')}|${options.model}|${digest(system)}|${messageIds(options.messages).join(',')}`
+}
+
+function idleError(message: string): LlmError {
+  return customLlmError(message, 'MODEL_IDLE')
 }
 
 /**
