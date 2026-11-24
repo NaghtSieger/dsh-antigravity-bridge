@@ -12,7 +12,7 @@
  * @module dsh-llm-antigravity-acp/conversation
  */
 
-import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { LlmError, ProviderRequestId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AcpPromptResult, AcpSessionUpdate } from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
@@ -31,7 +31,7 @@ export function reportsUpstream429(message: string): boolean {
 }
 // 识别上游明确的认证失效或策略/权限拒绝（401/403/TOS），首轮立即取消并保留原错，不干扰普通 429 分类。
 export function reportsUpstreamAuthOrPolicy(message: string): boolean {
-  return /\b(?:UNAUTHENTICATED|TOS_VIOLATION|PERMISSION_DENIED)\b|\b(?:http|status|code)[_=:\s]*(?:401|403)\b/i.test(message)
+  return /(?:^|[\s:(])(?:401|403)\b|\b(?:http|status|code)[_=:\s]*(?:401|403)\b|\b(?:UNAUTHENTICATED|TOS_VIOLATION|PERMISSION_DENIED)\b/i.test(message)
 }
 /** Prefix of `AGENT_RETRY_NOTICE` while its opening words arrive across chunks. */
 const AGENT_RETRY_PREFIX = /^\s*⚠\s*(?:e(?:r(?:r(?:o(?:r:?)?)?)?)?\s*)?(?:a(?:p(?:i(?:\s+e(?:r(?:r(?:o(?:r(?:\s*\((?:a(?:t(?:t(?:e(?:m(?:p(?:t(?:\s*\d*)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/i
@@ -279,6 +279,7 @@ export class AcpTurn {
   /** Terminal transport or overload failure reported as message text by agy. */
   agentFailure: LlmError | undefined
   upstreamRateLimited = false
+  upstreamPolicyAborted = false
   cancelRateRetry?: () => void
   onRateRetry?: (message: string) => void
   private rateFlushPending = false
@@ -466,6 +467,7 @@ export class AcpTurn {
     if (verdict.kind === 'rate-retry' || verdict.kind === 'auth-policy-retry') {
       this.noticeHold = combined
       if (verdict.kind === 'rate-retry') this.upstreamRateLimited = true
+      else this.upstreamPolicyAborted = true
       if (!this.rateFlushPending) {
         this.rateFlushPending = true
         this.finished = true
@@ -513,10 +515,17 @@ export class AcpTurn {
     }
     if (verdict.kind === 'auth-policy-retry') {
       this.rateFlushPending = false
-      const isAuth = /\bUNAUTHENTICATED\b|\b(?:http|status|code)[_=:\s]*401\b/i.test(verdict.message)
-      this.agentFailure = isAuth
-        ? new LlmError(labeled('AUTH', verdict.message), 'AUTH', { status: 401 })
-        : customLlmError(labeled('PERMISSION_DENIED', verdict.message), 'PERMISSION_DENIED', { status: 403 })
+      const requestId = /\b(?:request_?id|trace_?id|x-(?:goog-)?request-id)"?\s*[:=]\s*"?([\w.:-]+)/i.exec(verdict.message)?.[1]
+      const isPolicy403 = /\b(?:TOS_VIOLATION|PERMISSION_DENIED)\b|(?:^|[\s:(])403\b|\b(?:http|status|code)[_=:\s]*403\b/i.test(verdict.message)
+      this.agentFailure = isPolicy403
+        ? customLlmError(labeled('PERMISSION_DENIED', verdict.message), 'PERMISSION_DENIED', {
+            status: 403,
+            ...(requestId === undefined ? {} : { requestId: ProviderRequestId(requestId) }),
+          })
+        : new LlmError(labeled('AUTH', verdict.message), 'AUTH', {
+            status: 401,
+            ...(requestId === undefined ? {} : { requestId: ProviderRequestId(requestId) }),
+          })
       this.onRateRetry?.(verdict.message)
       return ''
     }

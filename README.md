@@ -34,7 +34,12 @@ dsh plugin --profile PROFILE_NAME add "git+https://github.com/NaghtSieger/dsh-an
 
 ## 来源与许可
 
-基于 lili-luo 的 dsh-llm-antigravity-acp，保留原作者 MIT 许可。本仓库提供独立分发的桥接适配。[上游源码](https://github.com/lili-luo/dsh-plugin-bundle/tree/main/dsh-llm-antigravity-acp) · [MIT 许可证](LICENSE)
+基于 [catcatchcatast/dsh-antigravity-bridge](https://github.com/catcatchcatast/dsh-antigravity-bridge) 与 [lili-luo 的 dsh-llm-antigravity-acp](https://github.com/lili-luo/dsh-plugin-bundle/tree/main/dsh-llm-antigravity-acp)，保留原作者 MIT 许可。[MIT 许可证](LICENSE)
+
+本仓库在上游基础上额外叠加了 3 项加固与兼容：
+- **macOS / Linux 常见路径自动探测**：未配置 `command` 且 `PATH` 缺失时自动探测 `~/.local/bin/agy`、`~/.antigravity/bin/agy`、`/opt/homebrew/bin/agy`、`/usr/local/bin/agy` 等独立 CLI 路径（不误选 IDE shim）。
+- **子进程认证环境隔离**：启动 `agy` 时通过 tombstone 剥离 `GEMINI_API_KEY`、`GOOGLE_API_KEY`、`AGY_ADC_AUTH`、`DSH_AGY_LOCAL_KEY`，避免环境残留覆盖订阅 OAuth。
+- **401 / 403 / TOS 首轮立即取消**：流中首次出现明确认证/策略拒绝时立刻取消并保留原始错误与 `requestId`，防止工具结果晚到触发二次请求，同时保持上游 429 与额度分类逻辑不变；兼容 DSH `0.2.2-rc.5` `LlmError.fromFailure`。
 
 ## 已验证范围
 

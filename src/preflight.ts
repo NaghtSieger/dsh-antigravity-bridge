@@ -139,7 +139,6 @@ export function resolveAgyBinary(configured: string, options: ResolveBinaryOptio
       join(home, '.antigravity', 'bin', 'agy'),
       '/opt/homebrew/bin/agy',
       '/usr/local/bin/agy',
-      '/Applications/Antigravity.app/Contents/Resources/app/bin/agy',
     )
   } else if (platform !== 'win32') {
     candidates.push(
