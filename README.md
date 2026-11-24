@@ -1,13 +1,6 @@
 # Antigravity bridge for DeepSeek Harness
 
-通过官方 Antigravity CLI 的 ACP 接口，把本机可用的模型接入 DeepSeek Harness (DSH)。默认 `safe-bridge` 安全桥接模式**完整保留官方 `systemInstruction` 不篡改**，通过 ACP 原生元数据关闭 `agy` 内置工具，由 DSH 100% 接管工具声明、执行与审批；同时融合了多个社区优秀方案的核心工程与防封能力：
-
-- **默认 `safe-bridge` 防封模式**：不传 `--agent dsh-bridge`、不设 `excludeDefaultComponents: true`、不修改 `_meta.antigravity.systemPrompt`；通过 `_meta.antigravity: { enabledTools: [], eagerMcpServers: ['dsh'] }` 关闭原生工具并将中性化工作区指南与精确工具签名放入首轮消息（仍保留 `bridge` / `native` 可切换）。
-- **429 / 403 / TOS 首轮熔断器（`circuitBreakerOn429: true`）**：检测到上游 `RESOURCE_EXHAUSTED` / `TOS_VIOLATION` / `PERMISSION_DENIED` / `UNAUTHENTICATED` 时立刻发 `session/cancel` 截断 `agy` 内部重试风暴，避免连撞升级为封号。
-- **完整兼容 `agy 1.5.15+` 会话后缀**：权限门禁与回环调用严格识别 `mcp_dsh_<8hex>_<tool>` 与 `dsh_<8hex>`，同时 100% 拒绝所有 `agy` 原生工具与外来 MCP。
-- **MCP 参数清洗与前置校验**：自动剔除未声明的 `toolSummary` 字段保护严格 Schema；缺必填参数时在桥接层直接返回带正确签名的可修正报错。
-- **环境变量隔离与 macOS 自动探测**：拉起子进程前自动剥离 `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `AGY_ADC_AUTH` / `DSH_AGY_LOCAL_KEY` 防止误扣按量费；自动探测 macOS 常见 `agy` 路径。
-- **保留原有全部长处**：SSE 立即发响应头 + 15s 保活 + 85s `dsh_await_result` 长时工具中继、`splitReplay` 长历史安全分片、5 维 SQLite 暗降级检测、多账号池与额度胶囊、`xhigh` 思考档、DSH `0.2.2-rc.5` `LlmError.fromFailure` 兼容。
+通过官方 Antigravity CLI 的 ACP 接口，把本机可用的模型接入 DeepSeek Harness (DSH)。默认 bridge 模式由 DSH 声明工具、执行工具并处理审批。插件使用当前会话提供的工作区、工具和规则；模型目录来自 CLI，显示名称和隐藏规则由每个安装实例单独配置。
 
 ## 安装
 

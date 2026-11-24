@@ -25,10 +25,14 @@ export { CALL_TOOL_NAME }
 
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
 const AGENT_RETRY_NOTICE = /^\s*⚠\s*(?:Error:\s*)?API error \(attempt \d+\)/i
-/** In-band upstream quota/policy/auth failure inside an `agy` retry notice that must trip the attempt-1 circuit breaker. */
-const AGENT_POLICY_FAILURE = /(?:RESOURCE_EXHAUSTED|TOS_VIOLATION|PERMISSION_DENIED|UNAUTHENTICATED|\bcode\s*(?:429|403|401)\b)/i
-/** Auth-specific failure inside an `agy` retry notice. */
-const AGENT_AUTH_FAILURE = /(?:UNAUTHENTICATED|\bcode\s*401\b)/i
+// 识别上游返回的限流通知，结束当前请求。
+export function reportsUpstream429(message: string): boolean {
+  return /(?:^|[\s:(])429\b|\b(?:http|status|code)[_=:]\s*429\b|\b(?:RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|too many requests)\b/i.test(message)
+}
+// 识别上游明确的认证失效或策略/权限拒绝（401/403/TOS），首轮立即取消并保留原错，不干扰普通 429 分类。
+export function reportsUpstreamAuthOrPolicy(message: string): boolean {
+  return /\b(?:UNAUTHENTICATED|TOS_VIOLATION|PERMISSION_DENIED)\b|\b(?:http|status|code)[_=:\s]*(?:401|403)\b/i.test(message)
+}
 /** Prefix of `AGENT_RETRY_NOTICE` while its opening words arrive across chunks. */
 const AGENT_RETRY_PREFIX = /^\s*⚠\s*(?:e(?:r(?:r(?:o(?:r:?)?)?)?)?\s*)?(?:a(?:p(?:i(?:\s+e(?:r(?:r(?:o(?:r(?:\s*\((?:a(?:t(?:t(?:e(?:m(?:p(?:t(?:\s*\d*)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/i
 /** Lone warning prefix (`⚠` or `⚠ Error:`) before the notice body arrives. */
@@ -50,8 +54,9 @@ export type AgentNoticeVerdict =
   | { kind: 'emit' }
   | { kind: 'hold' }
   | { kind: 'drop' }
+  | { kind: 'rate-retry'; message: string }
+  | { kind: 'auth-policy-retry'; message: string }
   | { kind: 'error'; code: 'TRANSPORT' | 'RATE_LIMIT'; message: string }
-  | { kind: 'circuit-break'; code: 'QUOTA' | 'AUTH'; message: string }
 
 /** Collapse agy's warning mark and line breaks so the notice can be recognized across chunks. */
 function noticeText(raw: string): string {
@@ -112,14 +117,11 @@ export function classifyAgentNotice(raw: string, final = false): AgentNoticeVerd
   if (outputLimit === 'drop') return { kind: 'drop' }
   if (outputLimit === 'hold') return final ? { kind: 'emit' } : { kind: 'hold' }
   if (AGENT_RETRY_NOTICE.test(raw)) {
-    if (AGENT_POLICY_FAILURE.test(raw)) {
-      const code = AGENT_AUTH_FAILURE.test(raw) ? 'AUTH' : 'QUOTA'
-      return {
-        kind: 'circuit-break',
-        code,
-        message: `Antigravity upstream quota/policy rejection (circuit breaker tripped to prevent retry storm): ${raw.trim()}`,
-      }
-    }
+    const notice = raw.trimStart().split(/\r?\n/, 1)[0] ?? ''
+    const detail = notice.replace(AGENT_RETRY_NOTICE, '')
+    if (reportsUpstream429(detail)) return { kind: 'rate-retry', message: notice }
+    if (reportsUpstreamAuthOrPolicy(detail)) return { kind: 'auth-policy-retry', message: notice }
+    if (!final && !raw.trimStart().includes('\n') && !/\b(?:EOF|ECONNRESET|ETIMEDOUT)\b/i.test(notice)) return { kind: 'hold' }
     return { kind: 'drop' }
   }
   if (!final && (WARNING_PREFIX.test(raw) || AGENT_RETRY_PREFIX.test(raw.trim()))) {
@@ -129,7 +131,7 @@ export function classifyAgentNotice(raw: string, final = false): AgentNoticeVerd
   if (text.length === 0) return { kind: 'emit' }
   if (raw.trimStart().startsWith('\u26a0')) {
     const expected = RESOURCE_WARNING.toLowerCase()
-    if (text === expected) return { kind: 'error', code: 'RATE_LIMIT', message: RESOURCE_WARNING }
+    if (text === expected) return { kind: 'rate-retry', message: RESOURCE_WARNING }
     if (!final && expected.startsWith(text)) return { kind: 'hold' }
   }
   const network = matchTerminalNotice(raw, text, NETWORK_ISSUE_HEAD, 'TRANSPORT', NETWORK_ISSUE_MESSAGE, final)
@@ -276,6 +278,10 @@ export class AcpTurn {
   retryNotices = 0
   /** Terminal transport or overload failure reported as message text by agy. */
   agentFailure: LlmError | undefined
+  upstreamRateLimited = false
+  cancelRateRetry?: () => void
+  onRateRetry?: (message: string) => void
+  private rateFlushPending = false
   /** Message text that may still be the start of an agy status notice. */
   private noticeHold = ''
   /** Model calls inside this turn whose usage was already emitted per-step from SQLite. */
@@ -297,13 +303,8 @@ export class AcpTurn {
   /**
    * @param turnTag - unique per-turn hex tag used in synthesized call ids (`agy_<turnTag>_<n>`).
    * @param nativeMode - whether to emit concise `[agy]` reasoning traces for built-in tool calls.
-   * @param onCircuitBreak - invoked immediately when an upstream 429/403/TOS policy error trips the attempt-1 circuit breaker.
    */
-  constructor(
-    private readonly turnTag: string,
-    private readonly nativeMode = false,
-    private readonly onCircuitBreak?: (error: LlmError) => void,
-  ) {}
+  constructor(private readonly turnTag: string, private readonly nativeMode = false) {}
 
   /**
    * Record one batch of per-step model usage read from the local session DB.
@@ -404,6 +405,7 @@ export class AcpTurn {
    * @param update - the agent notification.
    */
   onUpdate(update: AcpSessionUpdate): void {
+    if (this.finished && !(this.rateFlushPending && update.sessionUpdate === 'agent_message_chunk')) return
     const text = update.content?.type === 'text' ? update.content.text ?? '' : ''
     if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update'
       || (update.sessionUpdate === 'plan' && Array.isArray(update.entries) && update.entries.length > 0)
@@ -447,12 +449,35 @@ export class AcpTurn {
       return
     }
     const combined = this.noticeHold + text
+    const body = combined.trimStart()
+    const newline = body.indexOf('\n')
+    if (newline >= 0 && newline + 1 < body.length && AGENT_RETRY_NOTICE.test(body)) {
+      this.noticeHold = ''
+      this.consumeMessage(body.slice(0, newline + 1))
+      if (!this.finished) this.consumeMessage(body.slice(newline + 1))
+      return
+    }
     const verdict = classifyAgentNotice(combined, false)
     if (verdict.kind === 'hold') {
       this.noticeHold = combined
       return
     }
     this.noticeHold = ''
+    if (verdict.kind === 'rate-retry' || verdict.kind === 'auth-policy-retry') {
+      this.noticeHold = combined
+      if (verdict.kind === 'rate-retry') this.upstreamRateLimited = true
+      if (!this.rateFlushPending) {
+        this.rateFlushPending = true
+        this.finished = true
+        this.cancelRateRetry?.()
+        // 立即取消。换行或 RPC 结束就交付诊断；CLI 不回执时最多给在途错误尾部 100 ms。
+        if (!body.includes('\n')) setTimeout(() => {
+          if (this.rateFlushPending) this.recoverNoticeHold()
+        }, 100).unref()
+      }
+      if (body.includes('\n')) this.recoverNoticeHold()
+      return
+    }
     if (verdict.kind === 'drop') {
       this.retryNotices++
       return
@@ -460,16 +485,6 @@ export class AcpTurn {
     if (verdict.kind === 'error') {
       this.retryNotices++
       this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
-      return
-    }
-    if (verdict.kind === 'circuit-break') {
-      this.retryNotices++
-      if (this.onCircuitBreak === undefined) return
-      const err = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
-      this.agentFailure = err
-      this.clearFirstResponseTimer()
-      this.onCircuitBreak(err)
-      this.events.push({ kind: 'error', error: err })
       return
     }
     if (combined.trim().length > 0) {
@@ -490,6 +505,21 @@ export class AcpTurn {
     const held = this.noticeHold
     this.noticeHold = ''
     const verdict = classifyAgentNotice(held, true)
+    if (verdict.kind === 'rate-retry') {
+      this.rateFlushPending = false
+      this.agentFailure = new LlmError(labeled('RATE_LIMIT', verdict.message), 'RATE_LIMIT')
+      this.onRateRetry?.(verdict.message)
+      return ''
+    }
+    if (verdict.kind === 'auth-policy-retry') {
+      this.rateFlushPending = false
+      const isAuth = /\bUNAUTHENTICATED\b|\b(?:http|status|code)[_=:\s]*401\b/i.test(verdict.message)
+      this.agentFailure = isAuth
+        ? new LlmError(labeled('AUTH', verdict.message), 'AUTH', { status: 401 })
+        : customLlmError(labeled('PERMISSION_DENIED', verdict.message), 'PERMISSION_DENIED', { status: 403 })
+      this.onRateRetry?.(verdict.message)
+      return ''
+    }
     if (verdict.kind === 'drop') {
       this.retryNotices++
       return ''
@@ -497,14 +527,6 @@ export class AcpTurn {
     if (verdict.kind === 'error') {
       this.retryNotices++
       this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
-      return ''
-    }
-    if (verdict.kind === 'circuit-break') {
-      this.retryNotices++
-      if (this.onCircuitBreak === undefined) return ''
-      const err = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
-      this.agentFailure = err
-      this.onCircuitBreak(err)
       return ''
     }
     if (this.agentFailure !== undefined && WARNING_PREFIX.test(held)) {
@@ -832,7 +854,7 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
       case 'error':
         turn.finished = true
         yield * close()
-        throw event.error
+        throw turn.agentFailure ?? event.error
     }
   }
 }

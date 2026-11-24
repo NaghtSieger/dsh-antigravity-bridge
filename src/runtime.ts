@@ -6,6 +6,7 @@
 
 
 
+
 /**
  * Process, session, and conversation orchestration for the Antigravity ACP
  * provider. One `agy acp` front serves every conversation; each DSH session
@@ -13,13 +14,15 @@
  * advances incrementally, so subagents and the main conversation run
  * concurrently without sharing a turn.
  * @module dsh-llm-antigravity-acp/runtime
+
+
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
-import { LlmError } from '@deepseek-ai/dsh-llm'
+import { LlmError, ProviderRequestId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { AcpProcess, type AcpConfigOption, type AcpPermissionOutcome, type AcpPermissionRequest, type AcpPromptResult, type AcpSpawner } from './acp-process.ts'
 import {
@@ -34,12 +37,11 @@ import {
 } from './accounts.ts'
 import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type AvailableModel, type CatalogModel } from './catalog.ts'
 import { asDegradeAction, asEffort, asEngineMode, current, EFFORTS, type AccountProfile, type Config, type DegradeAction, type Effort, type EngineMode } from './config.ts'
-import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
+import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, reportsUpstream429, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
 import {
-  BRIDGE_TEXT_BYTES, EMPTY_INPUT_CONTINUATION, extractMessageImages, formatSafeBridgeGuidelines, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, MCP_SERVER_NAME,
-  partitionBridgePrompt, prepareBridgeInput, prepareNativeRequest, promptTextBytes,
+  addBridgeSystemInstruction, bridgeContextBlock, promptTextBytes, BRIDGE_TEXT_BYTES, bridgeSystemIdentity, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, prepareNativeRequest, splitReplay,
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
-  type AcpPromptBlock, type ImageResolver, type NativeSandboxMode, type NativeSessionContext, type StageableSegment,
+  type AcpPromptBlock, type ImageResolver, type NativeSandboxMode, type NativeSessionContext,
 } from './history.ts'
 import { labeled } from './labels.ts'
 import { JsonRpcClosedError, JsonRpcRemoteError } from './jsonrpc.ts'
@@ -54,21 +56,22 @@ import { binaryDigest, pluginBuildDigest } from './run-fingerprint.ts'
 import { SessionStore } from './session-store.ts'
 import { newSlot, rebaseSlot, slotDeniesModel, slotDisablesModel, type AccountSlot } from './slots.ts'
 import {
-  answerPermission as decidePermission, boundBridgeContent, consumeToolDelta, filterToolsForEngineMode,
-  MAX_EAGER_BRIDGE_TOOL_BYTES, renderToolSignatures, resolveActiveToolSchemas, sanitizeMcpToolArguments,
-  stripAgentToolPrefix, toBridgeTools, validateRequiredToolArguments,
+  answerPermission as decidePermission, boundBridgeContent, bridgeTextBudgetBytes, consumeToolDelta, filterToolsForEngineMode,
+  MAX_BRIDGE_RESULT_BYTES, MAX_EAGER_BRIDGE_TOOL_BYTES, MAX_TOOL_RESULT_PAGE_BYTES, pageUtf8Text, READ_TOOL_RESULT, READ_TOOL_RESULT_NAME,
+  resolveActiveToolSchemas, sanitizeMcpToolArguments, stripAgentToolPrefix, toBridgeTools, validateRequiredToolArguments, type Utf8TextPage,
 } from './tool-bridge.ts'
 import {
   hasGenMetadata, isGemini4Flagship, peekMaxGenMetadataIdx, peekMaxModelStepIdx,
   readGenUsageAfter, readModelStepTail, readModelStepsAfter, sessionDbPath,
   type DegradeFingerprintResult,
 } from './usage-db.ts'
-import { delay, digest, KeyedMutex } from './util.ts'
+import { customLlmError, delay, digest, KeyedMutex } from './util.ts'
 
 // The tool-bridge helpers stay importable from this module for existing consumers.
 export {
-  boundBridgeContent, boundBridgeToolText, compactBridgeTool, consumeToolDelta, filterToolsForEngineMode,
-  MAX_BRIDGE_RESULT_BYTES, MAX_EAGER_BRIDGE_TOOL_BYTES, NATIVE_OVERLAPPING_DSH_TOOLS, resolveActiveToolSchemas,
+  boundBridgeContent, boundBridgeToolText, bridgeTextBudgetBytes, compactBridgeTool, consumeToolDelta, filterToolsForEngineMode,
+  MAX_BRIDGE_RESULT_BYTES, MAX_EAGER_BRIDGE_TOOL_BYTES, MAX_TOOL_RESULT_PAGE_BYTES, NATIVE_OVERLAPPING_DSH_TOOLS,
+  pageUtf8Text, READ_TOOL_RESULT, READ_TOOL_RESULT_NAME, resolveActiveToolSchemas,
 } from './tool-bridge.ts'
 
 /** Parked calls answer with a still-running notice before Gemini cache TTL expiry and agy's 180-second MCP deadline. */
@@ -120,10 +123,8 @@ export interface LiveOverrides {
   longDecodeContinuations?: number
   /** Route-health intervention level for Gemini 4 flagship steps; see {@link DegradeAction}. */
   degradeAction?: DegradeAction
-  /** ACP agent engine mode (`safe-bridge`, `bridge`, or `native`); see {@link EngineMode}. */
+  /** ACP agent engine mode (`bridge` or `native`); see {@link EngineMode}. */
   engineMode?: EngineMode
-  /** Immediately cancel `agy`'s internal retry loop on attempt-1 upstream 429/403/TOS policy errors. */
-  circuitBreakerOn429?: boolean
   /**
    * Replace the whole account list, the machine account included as its
    * `system: true` entry. A list without one means the machine account was
@@ -161,10 +162,8 @@ export interface RuntimeStatus {
   longDecodeContinuations: number
   /** Live route-health intervention level. */
   degradeAction: DegradeAction
-  /** Live ACP agent engine mode (`safe-bridge`, `bridge`, or `native`). */
+  /** Live ACP agent engine mode (`bridge` or `native`). */
   engineMode: EngineMode
-  /** Whether attempt-1 upstream 429/403/TOS policy errors immediately trip the circuit breaker. */
-  circuitBreakerOn429: boolean
   models: { id: string; name: string }[]
   /** Every advertised family with the visibility the current allowlist gives it. */
   availableModels: { id: string; name: string; enabled: boolean }[]
@@ -188,6 +187,11 @@ interface PumpContext {
   nextKnownIds: string[]
 }
 
+interface CurrentToolResult {
+  isError: boolean
+  textParts: readonly string[]
+}
+
 /** Owner of the ACP processes, the MCP bridge, and every conversation. */
 export class AntigravityRuntime {
   readonly bridge: McpBridge
@@ -202,6 +206,8 @@ export class AntigravityRuntime {
   private lastAccount: string | undefined
   private readonly conversations = new Map<string, Conversation>()
   private readonly tenants = new Map<string, Conversation>()
+  /** Current DSH message reference; a page lookup searches it by the original tool-call id. */
+  private readonly currentToolMessages = new WeakMap<Conversation, readonly RequestMessage[]>()
   /** Per-turn call-id tags already issued or observed in history; keeps `<rootCallId>:ptc:<n>` unique session-wide. */
   private readonly usedTurnTags = new Set<string>()
   private readonly mutex = new KeyedMutex()
@@ -262,7 +268,7 @@ export class AntigravityRuntime {
     this.sessions.save(conv.dshSessionId, {
       acpSessionId: conv.sessionId,
       accountId: conv.accountId,
-      engineMode: conv.engineMode ?? this.engineMode(),
+      engineMode: conv.engineMode ?? 'bridge',
       ...(conv.sessionCwd !== undefined ? { sessionCwd: conv.sessionCwd } : {}),
       systemHash: conv.systemHash,
       knownIds: [...conv.knownIds],
@@ -323,7 +329,7 @@ export class AntigravityRuntime {
   private baseContextWindow(model: string): number {
     const window = this.contextWindow()
     const discovered = this.catalog.maxTokensFor(model)
-    if ((this.engineMode() === 'bridge' || this.engineMode() === 'safe-bridge') && discovered !== undefined && discovered > 0) return Math.min(window, discovered)
+    if (this.engineMode() === 'bridge' && discovered !== undefined && discovered > 0) return Math.min(window, discovered)
     if (this.configuredContextWindow() > 0) return window
     if (model.startsWith('gpt-oss')) return GPT_OSS_CONTEXT_WINDOW
     return discovered !== undefined && discovered > 0 ? Math.min(discovered, window) : window
@@ -370,24 +376,13 @@ export class AntigravityRuntime {
 
   /**
    * Active ACP agent engine mode: the settings-card override, then the volatile
-   * config field, then `safe-bridge`.
+   * config field, then `bridge`.
    * @returns the active engine mode.
    */
   engineMode(): EngineMode {
     return this.overrides.engineMode
       ?? asEngineMode(current((this.host.config as { engineMode?: unknown }).engineMode))
-      ?? 'safe-bridge'
-  }
-
-  /**
-   * Whether attempt-1 upstream 429/403/TOS errors immediately cancel `agy`'s
-   * internal retry loop to prevent retry storms.
-   * @returns true when the circuit breaker is enabled.
-   */
-  circuitBreakerOn429(): boolean {
-    if (typeof this.overrides.circuitBreakerOn429 === 'boolean') return this.overrides.circuitBreakerOn429
-    const configured = current((this.host.config as { circuitBreakerOn429?: unknown }).circuitBreakerOn429)
-    return typeof configured === 'boolean' ? configured : true
+      ?? 'bridge'
   }
 
   private providerHidden(): string[] {
@@ -621,7 +616,6 @@ export class AntigravityRuntime {
       longDecodeContinuations: this.longDecodeContinuations(),
       degradeAction: this.degradeAction(),
       engineMode: this.engineMode(),
-      circuitBreakerOn429: this.circuitBreakerOn429(),
       models: this.catalog.list().map(m => ({ ...m })),
       availableModels: this.catalog.availableModels().map(m => ({ ...m })),
       visibleModels: this.providerVisible(),
@@ -945,6 +939,7 @@ export class AntigravityRuntime {
     this.disposed = true
     if (this.sweeper !== undefined) clearInterval(this.sweeper)
     for (const conv of this.conversations.values()) {
+      this.currentToolMessages.delete(conv)
       if (conv.turn === undefined) this.persistConversation(conv)
       else conv.turn.abandon('The harness provider was unloaded.')
     }
@@ -1051,6 +1046,15 @@ export class AntigravityRuntime {
           }
           return
         } catch (error) {
+          // 收到上游 429 后结束本次请求，包括已输出内容的步骤。
+          const failure = mapError(error)
+          if (failure instanceof LlmError && failure.failure.status === 429) {
+            this.host.log.warn(`antigravity-acp: upstream 429 on ${options.model}: ${failure.message}`)
+            if (failure.code === 'QUOTA') this.pool.exhaustFor(layout.id,
+              cooldownKey === 'argon' && slot.subscriptionTier !== 'ULTRA' ? 'argon' : family,
+              resetTimeFromError(failure), failure.message)
+            throw failure
+          }
           if (emitted || attempted.has(layout.id)) throw error
           if (isUnknownModelFailure(error)) {
             slot.disabledModels = [...new Set([...(slot.disabledModels ?? []), options.model])]
@@ -1206,6 +1210,9 @@ export class AntigravityRuntime {
     const effectiveCwd = engineMode === 'native'
       ? (preferredNativeCwd ?? canonicalizeExistingDir(slot.layout.workspace) ?? slot.layout.workspace)
       : slot.layout.workspace
+    this.currentToolMessages.set(conv, preparedMessages)
+
+    const systemIdentity = engineMode === 'bridge' ? bridgeSystemIdentity(systemText) : systemText
     const sandboxMode: NativeSandboxMode | undefined = engineMode === 'native'
       ? (nativeReq?.sessionContext.sandboxMode ?? 'workspace-write')
       : undefined
@@ -1224,11 +1231,11 @@ export class AntigravityRuntime {
     const activeSchemas = resolveActiveToolSchemas(filteredTools, preparedMessages)
     const tools = toBridgeTools(activeSchemas, engineMode)
     conv.toolNames = new Set(tools.map(t => t.name))
-    conv.activeToolSchemas = new Map(activeSchemas.map(s => [s.name, s]))
+    conv.activeToolSchemas = new Map(activeSchemas.map(schema => [schema.name, schema]))
     conv.sandboxMode = sandboxMode
     conv.writableRoots = writableRoots
     const effort = this.effectiveEffort(options.model, asEffort(options.reasoningEffort) ?? this.defaultEffort())
-    const key = reanswerKey(options, systemText)
+    const key = reanswerKey(options, systemIdentity)
     const turnKey = userTurnKey(options, preparedMessages)
     if (this.turnBudgets.get(conv)?.turnKey !== turnKey) this.turnBudgets.set(conv, { turnKey, granted: 0 })
     if (conv.reanswer.key !== key) {
@@ -1241,15 +1248,15 @@ export class AntigravityRuntime {
       conv.reanswer.freshSession = false
     }
     if (conv.reanswer.awaiting) {
-      yield * this.reanswer(conv, slot, proc, options, effort, systemText, preparedMessages, activeSchemas, tools, engineMode, effectiveCwd, sandboxMode, writableRoots)
+      yield * this.reanswer(conv, slot, proc, options, effort, systemText, systemIdentity, preparedMessages, activeSchemas, tools, engineMode, effectiveCwd, sandboxMode, writableRoots)
       return
     }
 
     if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
-      if (!historyPrefixIntact(conv, systemText, preparedMessages)) {
+      if (!historyPrefixIntact(conv, systemIdentity, preparedMessages)) {
         this.dropTurn(conv, 'The conversation history was compacted or rewritten; rebuilding the session from the harness history.')
       } else {
-        const resumed = await this.deliverResults(conv, slot, preparedMessages, proc, tools)
+        const resumed = await this.deliverResults(conv, slot, preparedMessages, proc, tools, options.signal)
         if (resumed) {
           yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(preparedMessages) })
           return
@@ -1262,16 +1269,17 @@ export class AntigravityRuntime {
 
     let resumedFromDisk = false
     if (conv.sessionId === undefined && !conv.dirty && conv.purpose === MAIN_PURPOSE && conv.dshSessionId !== undefined) {
-      resumedFromDisk = await this.tryResumePersistedSession(conv, slot, engineMode, effectiveCwd, systemText, preparedMessages, activeSchemas, proc)
+      resumedFromDisk = await this.tryResumePersistedSession(conv, slot, engineMode, effectiveCwd, systemIdentity, preparedMessages, activeSchemas, proc)
     }
 
-    const plan = planPrompt(conv, systemText, preparedMessages, this.host.config.provider)
+    const plan = planPrompt(conv, systemIdentity, preparedMessages, this.host.config.provider)
     if (plan.rebuild) await this.resetSession(conv)
+    conv.activeToolSchemas = new Map(activeSchemas.map(schema => [schema.name, schema]))
     conv.sandboxMode = sandboxMode
     conv.writableRoots = writableRoots
     const freshSession = conv.sessionId === undefined
     if (freshSession) {
-      conv.systemHash = digest(systemText)
+      conv.systemHash = digest(systemIdentity)
       await this.openSession(conv, slot, engineMode, effectiveCwd, systemText, activeSchemas, tools, proc)
     }
     const switched = await this.select(conv, proc, options.model, effort)
@@ -1281,30 +1289,20 @@ export class AntigravityRuntime {
     }
     const replayBudget = engineMode === 'native' ? (slot.preflight?.unlock.status === 'unlocked' ? UNLOCKED_REPLAY_BUDGET_BYTES : LOCKED_REPLAY_BUDGET_BYTES) : undefined
     let blocks: AcpPromptBlock[]
-    let toolDelta = ''
     if (plan.rebuild) {
       blocks = await replayPrompt(plan.history, plan.input, this.host.readImage, replayBudget)
     } else {
       blocks = await inputPrompt(plan.input, this.host.readImage, { omitPureToolUpdates: true })
-      toolDelta = consumeToolDelta(conv, tools)
-      if (toolDelta.length > 0) blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
+      const toolDelta = consumeToolDelta(conv, tools)
+      if (toolDelta.length > 0) blocks.unshift(bridgeContextBlock(`${toolDelta}\n\n`))
+    }
+    if (engineMode === 'bridge' && freshSession) {
+      blocks = addBridgeSystemInstruction(blocks, systemText, conv.tenantKey !== undefined, plan.rebuild && plan.history.length > 0)
     }
     const nextKnownIds = messageIds(preparedMessages)
-    const guidelinesBlock = engineMode === 'safe-bridge' && freshSession
-      ? this.safeBridgeGuidelinesBlock(systemText, activeSchemas)
-      : undefined
-    const finalBlocks = await this.handoff(conv, proc, {
-      blocks,
-      rebuild: plan.rebuild,
-      history: plan.history,
-      input: plan.input,
-      omitPureToolUpdates: !plan.rebuild,
-      toolDelta,
-      guidelinesBlock,
-      signal: options.signal,
-    })
+    const finalBlocks = await this.handoff(conv, proc, blocks, plan.rebuild && plan.history.length > 0, options.signal)
     conv.reportedToolCalls.clear()
-    conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native', this.createCircuitBreaker(conv, proc))
+    conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native')
     conv.health.beginTurn()
     // Record the request this prompt belongs to; a rebuild above (which
     // replaced the whole bookkeeping object) already cleared it.
@@ -1316,7 +1314,7 @@ export class AntigravityRuntime {
     if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
-    const waitForFirstResponse = (engineMode === 'bridge' || engineMode === 'safe-bridge') && plan.input.some(message => message.role === 'user')
+    const waitForFirstResponse = engineMode === 'bridge' && plan.input.some(message => message.role === 'user')
     this.startPrompt(conv, proc, finalBlocks, waitForFirstResponse, options.signal)
     yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds })
   }
@@ -1350,6 +1348,7 @@ export class AntigravityRuntime {
     options: GenerateOptions,
     effort: Effort,
     system: string,
+    systemIdentity: string,
     messages: readonly RequestMessage[],
     activeSchemas: readonly ToolSchema[],
     tools: readonly BridgeTool[],
@@ -1366,7 +1365,6 @@ export class AntigravityRuntime {
     conv.reportedToolCalls.clear()
     conv.health.beginTurn()
     let blocks: AcpPromptBlock[]
-    let replayPlan: ReturnType<typeof planPrompt> | undefined
     if (fresh) {
       // A cold session that never finished a round is replaced with its own prompt
       // replayed verbatim; a session whose recorded blocks were incremental gets a
@@ -1374,32 +1372,30 @@ export class AntigravityRuntime {
       // the conversation that session was already carrying.
       const replayEscaped = state.blocksAreReplay !== true && original.length > 0
       await this.resetSession(conv)
-      const computedPlan = replayEscaped || (original.length > 0 && state.blocksAreReplay === true)
-        ? planPrompt(conv, system, messages, this.host.config.provider)
+      conv.activeToolSchemas = new Map(activeSchemas.map(schema => [schema.name, schema]))
+      const plan = replayEscaped
+        ? planPrompt(conv, systemIdentity, messages, this.host.config.provider)
         : undefined
-      const plan = replayEscaped ? computedPlan : undefined
       conv.reanswer.key = state.key
       conv.reanswer.granted = state.granted
       conv.reanswer.blocks = original
       conv.reanswer.blocksAreReplay = state.blocksAreReplay
-      conv.systemHash = digest(system)
+      conv.systemHash = digest(systemIdentity)
       // Tag the replayed system text so the fresh session's first 2048-token block hashes
       // differently upstream: the fallback pool's prefix cache no longer matches this request.
-      await this.openSession(conv, slot, engineMode, effectiveCwd, `[reanswer:${conv.tag}:${state.granted}]\n\n${system}`, activeSchemas, tools, proc)
+      const reanswerSystem = engineMode === 'native' ? `[reanswer:${conv.tag}:${state.granted}]\n\n${system}` : system
+      await this.openSession(conv, slot, engineMode, effectiveCwd, reanswerSystem, activeSchemas, tools, proc)
       await this.select(conv, proc, options.model, effort)
       if (plan !== undefined) {
         const replayBudget = engineMode === 'native' ? (slot.preflight?.unlock.status === 'unlocked' ? UNLOCKED_REPLAY_BUDGET_BYTES : LOCKED_REPLAY_BUDGET_BYTES) : undefined
         blocks = await replayPrompt(plan.history, plan.input, this.host.readImage, replayBudget)
+        if (engineMode === 'bridge') blocks = addBridgeSystemInstruction(blocks, reanswerSystem, conv.tenantKey !== undefined, plan.history.length > 0)
         // A later replacement of this session must re-send the full replay, not the
         // stale incremental input the replaced session was originally sent.
         conv.reanswer.blocks = blocks
         conv.reanswer.blocksAreReplay = true
-        replayPlan = plan
-      } else if (original.length > 0) {
-        blocks = original
-        replayPlan = computedPlan
       } else {
-        blocks = [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
+        blocks = original.length > 0 ? original : [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
       }
     } else {
       conv.promptGen++
@@ -1408,22 +1404,10 @@ export class AntigravityRuntime {
     }
     conv.sandboxMode = sandboxMode
     conv.writableRoots = writableRoots
-    const guidelinesBlock = engineMode === 'safe-bridge' && fresh
-      ? this.safeBridgeGuidelinesBlock(`[reanswer:${conv.tag}:${state.granted}]\n\n${system}`, activeSchemas)
-      : undefined
-    const finalBlocks = await this.handoff(conv, proc, {
-      blocks,
-      rebuild: replayPlan !== undefined,
-      history: replayPlan?.history ?? [],
-      input: replayPlan?.input ?? [],
-      omitPureToolUpdates: false,
-      guidelinesBlock,
-      signal: options.signal,
-    })
-    if (fresh && conv.sessionId !== undefined) {
-      this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
-    }
-    conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native', this.createCircuitBreaker(conv, proc, 'during reanswer'))
+    const hasHistory = fresh && planPrompt(conv, systemIdentity, messages, this.host.config.provider).history.length > 0
+    const finalBlocks = await this.handoff(conv, proc, blocks, hasHistory, options.signal)
+    if (fresh && conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
+    conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native')
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
     this.startPrompt(conv, proc, finalBlocks)
@@ -1496,14 +1480,11 @@ export class AntigravityRuntime {
       warn: message => this.host.log.warn(message),
     })
     try {
-      const loadMeta = engineMode === 'safe-bridge'
-        ? { antigravity: { enabledTools: [] as string[], eagerMcpServers: mount.mcpServers.length > 0 ? [MCP_SERVER_NAME] : [] } }
-        : { antigravity: { systemPrompt: { append: mount.systemAppend } } }
       const result = await proc.loadSession({
         sessionId: persisted.acpSessionId,
         cwd: effectiveCwd,
         mcpServers: mount.mcpServers,
-        _meta: loadMeta,
+        _meta: mount.sessionMeta,
       }, mount.listener, 60_000)
       conv.sessionId = result.sessionId || persisted.acpSessionId
       conv.process = proc
@@ -1522,6 +1503,8 @@ export class AntigravityRuntime {
       conv.engineMode = undefined
       conv.sessionCwd = undefined
       detachBridge(conv, tenant => this.releaseTenant(tenant))
+      const failure = mapError(error)
+      if (failure instanceof LlmError && failure.failure.status === 429) throw failure
       this.sessions.forget(dshId)
       this.host.log.info(`antigravity-acp: session/load unavailable for ${persisted.acpSessionId} (${error instanceof Error ? error.message : String(error)}); falling back to session/new`)
       return false
@@ -1750,6 +1733,7 @@ export class AntigravityRuntime {
       conv.tenantSecret = undefined
       conv.advertisedTools = []
       conv.advertisedToolNames.clear()
+      conv.activeToolSchemas.clear()
       conv.knownTools.clear()
       conv.reportedToolCalls.clear()
       this.resetUsageReading(conv)
@@ -1788,13 +1772,10 @@ export class AntigravityRuntime {
       warn: message => this.host.log.warn(message),
     })
     try {
-      const sessionMeta = engineMode === 'safe-bridge'
-        ? { antigravity: { enabledTools: [] as string[], eagerMcpServers: mount.mcpServers.length > 0 ? [MCP_SERVER_NAME] : [] } }
-        : { antigravity: { systemPrompt: { append: mount.systemAppend } } }
       const result = await proc.newSession({
         cwd: effectiveCwd,
         mcpServers: mount.mcpServers,
-        _meta: sessionMeta,
+        _meta: mount.sessionMeta,
       }, mount.listener, 120_000)
       conv.sessionId = result.sessionId
       conv.process = proc
@@ -1880,62 +1861,14 @@ export class AntigravityRuntime {
     conv.dirty = false
   }
 
-  private safeBridgeGuidelinesBlock(systemText: string, activeSchemas: readonly ToolSchema[]): { type: 'text'; text: string } | undefined {
-    const guidelines = formatSafeBridgeGuidelines(systemText, renderToolSignatures(activeSchemas), activeSchemas.length > 0)
-    return guidelines.length > 0 ? { type: 'text', text: `${guidelines}\n\n` } : undefined
-  }
-
-  private async handoff(
-    conv: Conversation,
-    proc: AcpProcess,
-    params: {
-      blocks: AcpPromptBlock[]
-      rebuild: boolean
-      history: readonly RequestMessage[]
-      input: readonly RequestMessage[]
-      omitPureToolUpdates: boolean
-      toolDelta?: string | undefined
-      guidelinesBlock?: { type: 'text'; text: string } | undefined
-      signal?: AbortSignal | undefined
-    },
-  ): Promise<AcpPromptBlock[]> {
-    const combined = params.guidelinesBlock !== undefined
-      ? [params.guidelinesBlock, ...params.blocks]
-      : [...params.blocks]
-    if (conv.engineMode !== 'bridge' && conv.engineMode !== 'safe-bridge') return combined
-    if (promptTextBytes(combined) <= BRIDGE_TEXT_BYTES) return combined
-
-    const stageable: StageableSegment[] = []
-    if (params.guidelinesBlock !== undefined) {
-      stageable.push({ kind: 'context', text: params.guidelinesBlock.text })
-    }
-    const hasHistoryBlock = params.rebuild && params.history.length > 0 && params.blocks[0]?.type === 'text'
-    if (hasHistoryBlock) {
-      stageable.push({ kind: 'history', text: (params.blocks[0] as Extract<AcpPromptBlock, { type: 'text' }>).text })
-    }
-    if (!params.rebuild && params.toolDelta !== undefined && params.toolDelta.length > 0) {
-      stageable.push({ kind: 'context', text: `${params.toolDelta}\n\n` })
-    }
-
-    let liveBlocks: AcpPromptBlock[]
-    if (params.input.length > 0) {
-      const prepared = await prepareBridgeInput(params.input, this.host.readImage, {
-        omitPureToolUpdates: params.omitPureToolUpdates,
-        fallbackText: hasHistoryBlock ? EMPTY_INPUT_CONTINUATION : 'Continue.',
-        limit: BRIDGE_TEXT_BYTES,
-      })
-      if (prepared.stageableText.length > 0) {
-        stageable.push({ kind: 'context', text: `${prepared.stageableText}\n\n` })
-      }
-      liveBlocks = prepared.liveBlocks
-    } else {
-      liveBlocks = hasHistoryBlock ? params.blocks.slice(1) : params.blocks
-    }
-
-    const { parts, final } = partitionBridgePrompt(stageable, liveBlocks, BRIDGE_TEXT_BYTES)
-    if (parts.length === 0) return combined
+  private async handoff(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[], hasHistory: boolean, signal?: AbortSignal): Promise<AcpPromptBlock[]> {
+    if (conv.engineMode !== 'bridge') return blocks
+    const { parts, final } = splitReplay(blocks, hasHistory)
+    if (parts.length === 0) return final
+    const finalBytes = promptTextBytes(final)
+    if (finalBytes > BRIDGE_TEXT_BYTES) return final
     try {
-      for (const part of parts) await proc.receiveHistory(conv.sessionId!, part, params.signal)
+      for (const part of parts) await proc.receiveHistory(conv.sessionId!, part, signal)
     } catch (error) {
       await this.resetSession(conv)
       throw error
@@ -1945,8 +1878,8 @@ export class AntigravityRuntime {
 
   private startPrompt(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[], waitForFirstResponse = false, signal?: AbortSignal): void {
     const turn = conv.turn as AcpTurn
-    if (conv.engineMode === 'bridge' || conv.engineMode === 'safe-bridge') {
-      const bytes = promptTextBytes(blocks)
+    if (conv.engineMode === 'bridge') {
+      const bytes = blocks.reduce((sum, b) => sum + (b.type === 'text' ? Buffer.byteLength(b.text) : 0), 0)
       if (bytes > BRIDGE_TEXT_BYTES) {
         turn.events.push({ kind: 'error', error: new LlmError(
           `Bridge input requires ${bytes} UTF-8 bytes, exceeding the ${BRIDGE_TEXT_BYTES}-byte ACP input budget. Compact the DSH context before replay.`,
@@ -1957,22 +1890,34 @@ export class AntigravityRuntime {
     }
     const generation = ++conv.promptGen
     const sessionId = conv.sessionId as string
+    let cancelled = false
+    const cancelOnce = () => {
+      if (cancelled || conv.turn !== turn || conv.promptGen !== generation || signal?.aborted) return
+      cancelled = true
+      proc.cancel(sessionId)
+    }
+    const interrupt = (error: Error) => {
+      if (signal?.aborted || conv.turn !== turn || conv.promptGen !== generation) return
+      cancelOnce()
+      conv.promptGen++
+      turn.finished = true
+      turn.clearFirstResponseTimer()
+      turn.events.push({ kind: 'error', error })
+    }
+    turn.cancelRateRetry = cancelOnce
+    turn.onRateRetry = message => interrupt(mapError(new Error(message)))
     if (waitForFirstResponse) {
-      turn.waitForFirstResponse(() => {
-        if (signal?.aborted || conv.turn !== turn || conv.promptGen !== generation) return
-        conv.promptGen++
-        turn.finished = true
-        const error = turn.agentFailure ?? new LlmError(labeled('TIMEOUT', 'No first response from Antigravity within 3 minutes'), 'TIMEOUT')
-        turn.events.push({ kind: 'error', error })
-        proc.cancel(sessionId)
-      })
+      turn.waitForFirstResponse(() => interrupt(turn.agentFailure ?? new LlmError(labeled('TIMEOUT', 'No first response from Antigravity within 3 minutes'), 'TIMEOUT')))
     }
     const p = proc.prompt(sessionId, blocks).then(
       (result) => {
         if (conv.turn === turn && conv.promptGen === generation) turn.events.push({ kind: 'done', result })
       },
       (error: unknown) => {
-        if (conv.turn === turn && conv.promptGen === generation) turn.events.push({ kind: 'error', error: mapError(error) })
+        if (conv.turn !== turn || conv.promptGen !== generation) return
+        const failure = mapError(error)
+        if (failure instanceof LlmError && failure.failure.status === 429) turn.upstreamRateLimited = true
+        turn.events.push({ kind: 'error', error: failure })
       },
     )
     conv.promptSettled = p.finally(() => turn.clearFirstResponseTimer())
@@ -2246,81 +2191,53 @@ export class AntigravityRuntime {
     conv.turn = undefined
   }
 
-  private createCircuitBreaker(
-    conv: Conversation,
-    proc: AcpProcess,
-    context?: string,
-  ): ((error: LlmError) => void) | undefined {
-    if (!this.circuitBreakerOn429()) return undefined
-    const where = context !== undefined ? ` ${context}` : ''
-    return (error: LlmError): void => {
-      this.host.log.warn(`antigravity-acp: circuit breaker tripped${where} on ${conv.key}: ${error.message}`)
-      if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
-    }
-  }
-
-  private async deliverResults(conv: Conversation, slot: AccountSlot, messages: readonly RequestMessage[], proc: AcpProcess, tools: readonly BridgeTool[]): Promise<boolean> {
+  private async deliverResults(conv: Conversation, slot: AccountSlot, messages: readonly RequestMessage[], proc: AcpProcess, tools: readonly BridgeTool[], signal?: AbortSignal): Promise<boolean> {
     const turn = conv.turn as AcpTurn
-    const results = new Map<string, Extract<RequestMessage, { role: 'tool' }>>()
-    const matchedIndices = new Set<number>()
-    let first = messages.length
-    messages.forEach((message, index) => {
-      if (message.role === 'tool' && turn.pendingCalls.has(message.toolCallId)) {
-        results.set(message.toolCallId, message)
-        matchedIndices.add(index)
-        first = Math.min(first, index)
+    const groups: { call: ParkedCall; message: Extract<RequestMessage, { role: 'tool' }>; extras: RequestMessage[] }[] = []
+    const seen = new Set<string>()
+    for (const message of messages) {
+      const call = message.role === 'tool' ? turn.pendingCalls.get(message.toolCallId) : undefined
+      if (message.role === 'tool' && call !== undefined) {
+        if (seen.has(call.id)) return false
+        seen.add(call.id)
+        groups.push({ call, message, extras: [] })
+      } else if (groups.length > 0) {
+        if (message.role === 'assistant' || message.role === 'tool') return false
+        if (message.role === 'developer' && message.content.length > 0
+          && message.content.every(b => b.type === 'tool-addition' || b.type === 'tool-removal')) continue
+        groups[groups.length - 1]!.extras.push(message)
       }
-    })
-    if (results.size !== turn.pendingCalls.size) return false
-    const extras = messages.slice(first).filter((_, offset) => !matchedIndices.has(first + offset))
-    if (extras.some(m => m.role === 'assistant' || m.role === 'tool')) return false
-    const nonPureExtras = extras.filter(
-      m => !(m.role === 'developer' && m.content.length > 0 && m.content.every(b => b.type === 'tool-addition' || b.type === 'tool-removal')),
-    )
-    const extraResolved = await this.resolveMessageImages(nonPureExtras)
-    const toolDelta = consumeToolDelta(conv, tools)
-    const suffix = [toolDelta, extraResolved.text].filter(Boolean).join('\n\n')
-    const pending = [...turn.pendingCalls.values()]
-    turn.pendingCalls.clear()
-    if (turn.finished || !this.isTurnLive(turn)) {
-      const pendingResolved = await this.resolveMessageImages(pending.map(call => results.get(call.id) as RequestMessage))
-      conv.reportedToolCalls.clear()
-      conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native', this.createCircuitBreaker(conv, proc, 'during tool continuation'))
-      if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
-      const fallbackText = `${pendingResolved.text}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.`
-      this.startPrompt(conv, proc, [
-        { type: 'text', text: fallbackText },
-        ...pendingResolved.images,
-        ...extraResolved.images,
-      ])
-      return true
     }
-    for (const [index, call] of pending.entries()) {
-      const message = results.get(call.id) as Extract<RequestMessage, { role: 'tool' }>
-      const isLast = index === pending.length - 1
-      const tail = isLast && suffix.length > 0 ? `\n\n${suffix}` : ''
-      const result = await this.toBridgeResult(call.name, message.content, message.isError === true, Buffer.byteLength(tail, 'utf8'))
-      if (tail.length > 0) result.content.push({ type: 'text', text: tail })
-      if (isLast && extraResolved.images.length > 0) result.content.push(...extraResolved.images)
-      call.result.resolve(result)
+    if (groups.length !== turn.pendingCalls.size || groups.length === 0) return false
+    turn.pendingCalls.clear()
+    if (turn.upstreamRateLimited) return true
+
+    const toolDelta = consumeToolDelta(conv, tools)
+    const ended = turn.finished || !this.isTurnLive(turn)
+    const continuation: AcpPromptBlock[] = []
+    for (const [index, { call, message, extras }] of groups.entries()) {
+      const tail: AcpPromptBlock[] = []
+      if (index === groups.length - 1 && toolDelta) tail.push(bridgeContextBlock('\n\n' + toolDelta))
+      if (extras.length > 0) tail.push({ type: 'text', text: '\n\n' }, ...await inputPrompt(extras, this.host.readImage))
+      if (ended) {
+        if (continuation.length > 0) continuation.push({ type: 'text', text: '\n\n' })
+        continuation.push(...await inputPrompt([message], this.host.readImage), ...tail)
+      } else {
+        const result = await this.toBridgeResult(conv, call.id, call.name, message.content, message.isError === true, promptTextBytes(tail))
+        result.content.push(...tail)
+        call.result.resolve(result)
+      }
+    }
+    if (ended) {
+      continuation.push({ type: 'text', text: '\n\nContinue the task with these tool results.' })
+      const blocks = await this.handoff(conv, proc, continuation, false, signal)
+      signal?.throwIfAborted()
+      conv.reportedToolCalls.clear()
+      conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native')
+      if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
+      this.startPrompt(conv, proc, blocks, false, signal)
     }
     return true
-  }
-
-  /**
-   * Render follow-up or fallback messages while preserving inline image blocks
-   * (e.g., DSH PTC `read_image` follow-up `user` messages) as real multimodal
-   * image items instead of flattening them into `[image sha256:...]` placeholders.
-   */
-  private async resolveMessageImages(
-    messages: readonly RequestMessage[],
-  ): Promise<{ text: string; images: Array<{ type: 'image'; data: string; mimeType: string }> }> {
-    if (messages.length === 0) return { text: '', images: [] }
-    const extracted = await extractMessageImages(messages, this.host.readImage, this.host.canReadImages())
-    return {
-      text: extracted.textMessages.length > 0 ? renderTranscript(extracted.textMessages) : '',
-      images: extracted.images,
-    }
   }
 
   private isTurnLive(turn: AcpTurn): boolean {
@@ -2331,7 +2248,10 @@ export class AntigravityRuntime {
   /**
    * Convert one DSH tool result into MCP content whose text stays within
    * `MAX_BRIDGE_RESULT_BYTES`, so `agy`'s own output truncation never cuts the
-   * middle out of it.
+   * middle out of it. When the result is bounded, keep its original text under
+   * this conversation's existing DSH tool-call id for lossless read-only paging.
+   * @param conv - owning DSH conversation, which scopes retained output.
+   * @param resultId - existing DSH tool-call id, also present in DSH history.
    * @param toolName - DSH tool name, which selects the bounding strategy.
    * @param content - DSH result blocks.
    * @param isError - whether the tool failed.
@@ -2339,19 +2259,20 @@ export class AntigravityRuntime {
    * a suffix over three quarters of the ceiling is kept whole and can carry the result past it.
    * @returns the bridge result.
    */
-  private async toBridgeResult(toolName: string, content: readonly ContentBlock[], isError: boolean, reservedBytes = 0): Promise<BridgeToolResult> {
+  private async toBridgeResult(
+    conv: Conversation,
+    resultId: string,
+    toolName: string,
+    content: readonly ContentBlock[],
+    isError: boolean,
+    reservedBytes = 0,
+  ): Promise<BridgeToolResult> {
     const items: BridgeContent[] = []
     for (const block of content) {
       if (block.type === 'text') {
         if (block.text.length > 0) items.push({ type: 'text', text: block.text })
       } else if (block.type === 'image' && block.offloaded !== true && this.host.canReadImages()) {
-        let image: { data: string; mimeType: string } | undefined
-        try {
-          image = await this.host.readImage(block)
-        } catch (error) {
-          this.host.log.warn(`antigravity-acp: failed to read tool-result image ${block.attachment.attachmentId}: ${error instanceof Error ? error.message : String(error)}`)
-          image = undefined
-        }
+        const image = await this.host.readImage(block)
         if (image !== undefined) items.push({ type: 'image', data: image.data, mimeType: image.mimeType })
         else items.push({ type: 'text', text: `[image ${block.attachment.attachmentId} unavailable]` })
       } else {
@@ -2360,7 +2281,28 @@ export class AntigravityRuntime {
       }
     }
     if (items.length === 0) items.push({ type: 'text', text: '(no output)' })
-    return { content: boundBridgeContent(toolName, items, reservedBytes, isError), ...isError ? { isError: true } : {} }
+    const textParts = content.flatMap(block => block.type === 'text' && block.text.length > 0 ? [block.text] : [])
+    const textBytes = textParts.reduce((sum, part) => sum + Buffer.byteLength(part, 'utf8'), 0)
+    if (textBytes <= bridgeTextBudgetBytes(reservedBytes) || conv.engineMode !== 'bridge') {
+      return { content: boundBridgeContent(toolName, items, reservedBytes, isError), ...isError ? { isError: true } : {} }
+    }
+
+    const notice = [
+      '[The tool result text was truncated to fit the MCP output limit.]',
+      `Read the full text from current DSH history without rerunning the source tool. There are ${textParts.length} zero-based text part(s); images and attachments remain in the initial result.`,
+      `source_tool: ${JSON.stringify(toolName)}`,
+      `source_is_error: ${isError}`,
+      `tool_result_page: ${JSON.stringify({ result_id: resultId, part: 0, offset: 0, limit: MAX_TOOL_RESULT_PAGE_BYTES })}`,
+      `Use UTF-8 byte offsets and the next_offset returned by each page; request each part index from 0 to ${textParts.length - 1}.`,
+    ].join('\n')
+    const noticeContent = `\n\n${notice}`
+    const bounded = boundBridgeContent(
+      toolName,
+      items,
+      reservedBytes + Buffer.byteLength(noticeContent, 'utf8'),
+      isError,
+    )
+    return { content: [...bounded, { type: 'text', text: noticeContent }], ...isError ? { isError: true } : {} }
   }
 
   private dropTurn(conv: Conversation, reason: string): void {
@@ -2394,7 +2336,9 @@ export class AntigravityRuntime {
   private listTools(tenantKey: string | undefined): BridgeTool[] {
     const conv = tenantKey === undefined ? undefined : this.tenants.get(tenantKey)
     if (conv === undefined) return []
-    return [...conv.advertisedTools, AWAIT_TOOL, CALL_TOOL]
+    const tools = [...conv.advertisedTools, AWAIT_TOOL, CALL_TOOL]
+    if (conv.engineMode === 'bridge') tools.push(READ_TOOL_RESULT)
+    return tools
   }
 
   /**
@@ -2523,52 +2467,124 @@ export class AntigravityRuntime {
       return { content: [{ type: 'text', text: 'No harness turn is waiting for this tool call.' }], isError: true }
     }
     turn.clearFirstResponseTimer()
-    if (request.name === AWAIT_TOOL_NAME) {
-      const callId = typeof request.arguments.call_id === 'string' ? request.arguments.call_id : ''
+    const knownNames = new Set([...conv.toolNames, AWAIT_TOOL_NAME, CALL_TOOL_NAME, ...(conv.engineMode === 'bridge' ? [READ_TOOL_RESULT_NAME] : [])])
+    const resolveName = (name: string): string => stripAgentToolPrefix(name, knownNames)
+    const canonicalRequestName = resolveName(request.name)
+    if (canonicalRequestName === CALL_TOOL_NAME) {
+      const rawTarget = typeof request.arguments.name === 'string' ? request.arguments.name.trim() : ''
+      let args = request.arguments.arguments
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args) }
+        catch { return { content: [{ type: 'text', text: 'Expected a JSON object in arguments.' }], isError: true } }
+        if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+          return { content: [{ type: 'text', text: 'Expected a JSON object in arguments.' }], isError: true }
+        }
+      }
+      return this.dispatchToolCall(conv, turn, resolveName(rawTarget), args, request.signal)
+    }
+    return this.dispatchToolCall(conv, turn, canonicalRequestName, request.arguments, request.signal)
+  }
+
+  private async dispatchToolCall(
+    conv: Conversation,
+    turn: AcpTurn,
+    name: string,
+    rawArguments: unknown,
+    signal: AbortSignal,
+  ): Promise<BridgeToolResult> {
+    const args = sanitizeMcpToolArguments(rawArguments, conv.activeToolSchemas.get(name))
+    if (conv.engineMode === 'bridge' && name === READ_TOOL_RESULT_NAME) return this.readToolResult(conv, args)
+    if (name === AWAIT_TOOL_NAME) {
+      const callId = typeof args.call_id === 'string' ? args.call_id : ''
       const call = turn.calls.get(callId)
       if (call === undefined) return { content: [{ type: 'text', text: `Unknown harness call id ${callId}.` }], isError: true }
       turn.relaying = false
-      return this.awaitCall(turn, call, request.signal)
+      return this.awaitCall(turn, call, signal)
     }
-    if (request.name === CALL_TOOL_NAME) {
-      const rawTarget = typeof request.arguments.name === 'string' ? request.arguments.name.trim() : ''
-      const targetName = stripAgentToolPrefix(rawTarget)
-      let rawArgs: unknown = request.arguments.arguments
-      if (typeof rawArgs === 'string' && rawArgs.trim().startsWith('{')) {
-        try {
-          rawArgs = JSON.parse(rawArgs)
-        } catch {
-          // Leave invalid JSON as-is so schema validation reports the missing/invalid fields.
-        }
-      }
-      const schema = conv.activeToolSchemas?.get(targetName)
-      const targetArgs = sanitizeMcpToolArguments(rawArgs, schema)
-      if (!conv.toolNames.has(targetName)) {
-        return { content: [{ type: 'text', text: `The harness has no tool named ${targetName}.` }], isError: true }
-      }
-      const validationError = validateRequiredToolArguments(schema, targetArgs)
-      if (validationError !== undefined) {
-        return { content: [{ type: 'text', text: validationError }], isError: true }
-      }
-      const gated = await this.evaluateToolGate(conv, turn, request.signal)
-      if (gated !== undefined) return gated
-      const call = turn.park(targetName, targetArgs)
-      return this.awaitCall(turn, call, request.signal)
+    if (!conv.toolNames.has(name)) {
+      return { content: [{ type: 'text', text: `The harness has no tool named ${name}.` }], isError: true }
     }
-    const canonicalName = conv.toolNames.has(request.name) ? request.name : stripAgentToolPrefix(request.name)
-    if (!conv.toolNames.has(canonicalName)) {
-      return { content: [{ type: 'text', text: `The harness has no tool named ${request.name}.` }], isError: true }
-    }
-    const schema = conv.activeToolSchemas?.get(canonicalName)
-    const sanitizedArgs = sanitizeMcpToolArguments(request.arguments, schema)
-    const validationError = validateRequiredToolArguments(schema, sanitizedArgs)
-    if (validationError !== undefined) {
-      return { content: [{ type: 'text', text: validationError }], isError: true }
-    }
-    const gated = await this.evaluateToolGate(conv, turn, request.signal)
+    const schema = conv.activeToolSchemas.get(name)
+    const validationError = validateRequiredToolArguments(schema, args)
+    if (validationError !== undefined) return { content: [{ type: 'text', text: validationError }], isError: true }
+    const gated = await this.evaluateToolGate(conv, turn, signal)
     if (gated !== undefined) return gated
-    const call = turn.park(canonicalName, sanitizedArgs)
-    return this.awaitCall(turn, call, request.signal)
+    const call = turn.park(name, args)
+    return this.awaitCall(turn, call, signal)
+  }
+
+  private readToolResult(conv: Conversation, args: Record<string, unknown>): BridgeToolResult {
+    const resultId = typeof args.result_id === 'string' ? args.result_id : ''
+    const part = args.part === undefined ? 0 : args.part
+    const offset = args.offset === undefined ? 0 : args.offset
+    const limit = args.limit === undefined ? MAX_TOOL_RESULT_PAGE_BYTES : args.limit
+    if (resultId.length === 0 || !Number.isInteger(part) || (part as number) < 0 || !Number.isInteger(offset) || !Number.isInteger(limit)) {
+      return { content: [{ type: 'text', text: 'Invalid tool result page arguments.' }], isError: true }
+    }
+    const messages = this.currentToolMessages.get(conv)
+    let message: RequestMessage | undefined
+    for (let index = (messages?.length ?? 0) - 1; index >= 0; index--) {
+      const candidate = messages?.[index]
+      if (candidate?.role === 'tool' && candidate.toolCallId === resultId) {
+        message = candidate
+        break
+      }
+    }
+    let source: CurrentToolResult | undefined
+    if (message?.role === 'tool') {
+      const textParts = message.content.flatMap((block: ContentBlock) => block.type === 'text' && block.text.length > 0 ? [block.text] : [])
+      if (textParts.length > 0) source = { isError: message.isError === true, textParts }
+    }
+    if (source === undefined) return { content: [{ type: 'text', text: 'Unknown tool result id.' }], isError: true }
+    const text = source.textParts[part as number]
+    if (text === undefined) return { content: [{ type: 'text', text: 'Unknown text part for tool result.' }], isError: true }
+    const sourceBytes = Buffer.from(text, 'utf8')
+    const requested = pageUtf8Text(sourceBytes, offset as number, limit as number)
+    if (!requested.ok) {
+      const message = requested.error === 'offset-out-of-range'
+        ? 'Tool result offset is past the end of the text part.'
+        : requested.error === 'invalid-limit'
+          ? `Tool result page limit must be between 4 and ${MAX_TOOL_RESULT_PAGE_BYTES} UTF-8 bytes.`
+          : 'Tool result offset must be a non-negative UTF-8 character boundary.'
+      return { content: [{ type: 'text', text: message }], isError: true }
+    }
+    const render = (page: Utf8TextPage): string => {
+      const pageBytes = Buffer.byteLength(page.text, 'utf8')
+      const header = [
+        `result_id: ${JSON.stringify(resultId)}`,
+        `source_is_error: ${source.isError}`,
+        `part: ${part} of ${source.textParts.length}`,
+        `byte_range: [${page.startOffset}, ${page.endOffset}) of ${page.totalBytes}`,
+        `page_bytes: ${pageBytes}`,
+        `next_offset: ${page.nextOffset ?? 'end'}`,
+        '---BEGIN_PAGE_TEXT---',
+      ].join('\n')
+      return `${header}\n${page.text}\n---END_PAGE_TEXT---`
+    }
+    const directContent = [{ type: 'text' as const, text: render(requested.page) }]
+    if (Buffer.byteLength(JSON.stringify({ content: directContent }), 'utf8') <= MAX_BRIDGE_RESULT_BYTES) {
+      return { content: directContent }
+    }
+    let low = 4
+    let high = limit as number
+    let selected: Utf8TextPage | undefined
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2)
+      const candidate = pageUtf8Text(sourceBytes, offset as number, middle)
+      if (!candidate.ok) break
+      const content = [{ type: 'text' as const, text: render(candidate.page) }]
+      const encodedBytes = Buffer.byteLength(JSON.stringify({ content }), 'utf8')
+      if (encodedBytes <= MAX_BRIDGE_RESULT_BYTES) {
+        selected = candidate.page
+        low = middle + 1
+      } else {
+        high = middle - 1
+      }
+    }
+    if (selected === undefined) return { content: [{ type: 'text', text: 'Unable to fit one UTF-8 code point in a tool result page.' }], isError: true }
+    return {
+      content: [{ type: 'text', text: render(selected) }],
+    }
   }
 
   private async awaitCall(turn: AcpTurn, call: ParkedCall, signal: AbortSignal): Promise<BridgeToolResult> {
@@ -2739,6 +2755,12 @@ function parseDurationMs(text: string): number | undefined {
  */
 function retryAfterMsFromError(error: unknown): number | undefined {
   const message = error instanceof Error ? error.message : String(error)
+  const retryAfter = /"retry-after"\s*:\s*(?:"([^"]+)"|(\d+(?:\.\d+)?))/i.exec(message)
+  if (retryAfter) {
+    const value = retryAfter[1] ?? retryAfter[2] ?? ''
+    const ms = /^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now()
+    if (Number.isFinite(ms) && ms > 0) return ms
+  }
   const quoted = /"retryDelay"\s*:\s*"([^"]+)"/i.exec(message)?.[1]
   if (quoted !== undefined) {
     const ms = parseDurationMs(quoted)
@@ -2826,13 +2848,39 @@ function turnSettled(turn: AcpTurn, timeoutMs: number): Promise<void> {
  * @returns an LlmError.
  */
 export function mapError(error: unknown): Error {
-  if (error instanceof LlmError) return error
+  if (error instanceof LlmError && error.code !== 'RATE_LIMIT') return error
   const message = error instanceof Error ? error.message : String(error)
-  if (error instanceof JsonRpcClosedError) return new LlmError(labeled('TRANSPORT', `Antigravity ACP link closed: ${message}`), 'TRANSPORT', { cause: error })
-  if (/authentication required|not logged in|unauthenticated|sign in/i.test(message)) {
-    return new LlmError(labeled('AUTH', message), 'AUTH', { cause: error })
+  const quota = /\bquota(?:\s+(?:has been|is|limit))?\s+(?:exhausted|depleted)\b|\b(?:daily|weekly|monthly)\s+(?:quota\s+)?limit\s+(?:reached|exceeded)\b|\bexhausted\s+(?:your\s+)?(?:daily\s+|weekly\s+|monthly\s+)?quota\b|\b(?:QUOTA_EXHAUSTED|DAILY_LIMIT_EXCEEDED|WEEKLY_LIMIT_EXCEEDED)\b/i.test(message)
+  const upstream = error instanceof JsonRpcRemoteError ? error.rpc.message : message
+  if (reportsUpstream429(upstream)
+      || (error instanceof LlmError && error.failure.status === 429)
+      || (error instanceof JsonRpcRemoteError && error.httpStatus === 429)
+      || /"reason":"(?:RATE_LIMIT_EXCEEDED|RESOURCE_EXHAUSTED)"/i.test(message)) {
+    const existing = error instanceof LlmError ? error.failure : undefined
+    const providerRetryAfterMs = existing?.providerRetryAfterMs ?? retryAfterMsFromError(error)
+    const requestId = existing?.requestId ?? /\b(?:request_?id|trace_?id|x-(?:goog-)?request-id)"?\s*[:=]\s*"?([\w.:-]+)/i.exec(message)?.[1]
+    const facts = {
+      code: quota ? 'QUOTA' : 'UPSTREAM_429', status: 429,
+      message: labeled(quota ? 'QUOTA' : 'RATE_LIMIT', message),
+      ...(providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs }),
+      ...(requestId === undefined ? {} : { requestId: ProviderRequestId(requestId) }),
+    }
+    return customLlmError(facts.message, facts.code, {
+      status: facts.status,
+      ...(facts.providerRetryAfterMs === undefined ? {} : { providerRetryAfterMs: facts.providerRetryAfterMs }),
+      ...(facts.requestId === undefined ? {} : { requestId: facts.requestId }),
+      cause: error,
+    })
   }
-  if (/\bquota(?:\s+(?:has been|is|limit))?\s+(?:exhausted|depleted)\b|\b(?:daily|weekly|monthly)\s+(?:quota\s+)?limit\s+(?:reached|exceeded)\b|\bexhausted\s+(?:your\s+)?(?:daily\s+|weekly\s+|monthly\s+)?quota\b|\b(?:QUOTA_EXHAUSTED|DAILY_LIMIT_EXCEEDED|WEEKLY_LIMIT_EXCEEDED)\b/i.test(message)) return new LlmError(labeled('QUOTA', message), 'QUOTA', { cause: error })
+  if (error instanceof LlmError) return error
+  if (error instanceof JsonRpcClosedError) return new LlmError(labeled('TRANSPORT', `Antigravity ACP link closed: ${message}`), 'TRANSPORT', { cause: error })
+  if (/authentication required|not logged in|unauthenticated|sign in|\b(?:http|status|code)[_=:\s]*401\b/i.test(message)) {
+    return new LlmError(labeled('AUTH', message), 'AUTH', { status: 401, cause: error })
+  }
+  if (/\b(?:TOS_VIOLATION|PERMISSION_DENIED)\b|\b(?:http|status|code)[_=:\s]*403\b/i.test(message)) {
+    return customLlmError(labeled('PERMISSION_DENIED', message), 'PERMISSION_DENIED', { status: 403, cause: error })
+  }
+  if (quota) return new LlmError(labeled('QUOTA', message), 'QUOTA', { cause: error })
   if (/rate.?limit|429|resource.?exhausted|too many requests|overloaded|capacity/i.test(message)) return new LlmError(labeled('RATE_LIMIT', message), 'RATE_LIMIT', { cause: error })
   if (/context|too long|token limit|maximum.*tokens/i.test(message)) return new LlmError(labeled('CONTEXT_WINDOW_EXCEEDED', message), 'CONTEXT_WINDOW_EXCEEDED', { cause: error })
   if (/timeout|timed out|deadline/i.test(message)) return new LlmError(labeled('TIMEOUT', message), 'TIMEOUT', { cause: error })

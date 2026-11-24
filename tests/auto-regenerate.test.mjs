@@ -1,5 +1,6 @@
 
 // Contract tests for automatic re-answering of a degraded Argon generation.
+
 //
 // A degraded attempt must not be re-rolled inside the plugin any more: the step
 // fails with the `DEGRADED_ROUTE` code so DSH's own request-retry layer calls
@@ -44,7 +45,7 @@ function makeRuntime({ config: configExtra = {}, host = {}, plan, env: envExtra 
     // These tests pin the re-answer machinery itself, so they opt into the
     // intervention level that refuses on any degraded verdict; the default
     // level is pinned in degrade-policy.test.mjs.
-    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, degradeAction: 'legacy', engineMode: 'bridge', ...configExtra,
+    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, degradeAction: 'legacy', ...configExtra,
   }
   const runtime = new AntigravityRuntime({
     config,
@@ -194,8 +195,10 @@ test('C2 the retry of the same request re-answers inside the warm ACP session wi
 
   const turns = prompts()
   assert.equal(turns.length, 2, 'exactly one continuation prompt answers the retry')
+  assert.equal((turns[0].text.match(/<dsh_system_instruction>/g) ?? []).length, 1, 'the initial bridge turn carries its rules once')
   assert.equal(turns[1].session, turns[0].session, 'the re-answer runs in the same ACP session')
   assert.ok(turns[1].text.includes(NOTICE), `the continuation prompt carries the reroll notice: ${turns[1].text}`)
+  assert.doesNotMatch(turns[1].text, /dsh_system_instruction/, 'a warm re-answer does not repeat the rules')
   assert.doesNotMatch(turns[1].text, HISTORY, 'a warm session is never replayed as history')
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 1, 'the warm retry opens no session/new')
 })
@@ -222,8 +225,9 @@ test('C3 a cold ACP session that degrades on its first turn is replaced and re-s
   assert.ok(turns[1].text.includes('list the workspace'), `the retry re-sends the original user input: ${turns[1].text}`)
   assert.ok(!turns[1].text.includes(NOTICE), 'the cold retry sends the original input, not a reroll notice')
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 2, 'the cold retry opens one fresh session/new')
-  assert.notEqual(turns[1].system, turns[0].system, 'the replayed system text must break the upstream prefix cache')
-  assert.ok(turns[1].system.includes('[reanswer:'), `the replayed system carries the reanswer tag: ${turns[1].system}`)
+  assert.equal(turns[0].system, '', 'bridge session/new receives no author-supplied ACP systemPrompt')
+  assert.equal(turns[1].system, '', 'cold bridge re-answer also receives no author-supplied ACP systemPrompt')
+  assert.equal((turns[1].text.match(/<dsh_system_instruction>/g) ?? []).length, 1, 'the new session receives the original rules once')
 })
 
 test('C4 a degraded tool gate drops the tool call and re-answers in the warm session', { timeout: 60_000 }, async () => {
@@ -371,14 +375,14 @@ test('C8 a warm session whose reroll already failed once escapes into a fresh se
   assert.equal(turns.length, 4, 'one prompt per attempt')
   assert.equal(turns[1].session, turns[0].session, 'the first reroll stays in the warm session')
   assert.ok(turns[2].text.includes(NOTICE), `the first reroll is a continuation notice: ${turns[2].text}`)
+  assert.doesNotMatch(turns[1].text + turns[2].text, /dsh_system_instruction|RULE_C8_291/, 'warm rerolls do not repeat the rules')
   assert.notEqual(turns[3].session, turns[1].session, 'the second reroll replaces the poisoned session')
-  assert.equal(turns[3].system.split(rule).length - 1, 1)
-  assert.ok(!turns[3].text.includes(rule), 'initial rules stay out of replayed messages')
+  assert.equal((turns[3].text.match(new RegExp(rule, 'g')) ?? []).length, 1, 'the replacement session gets the original rules once')
+  assert.equal(turns[3].system, '', 'bridge replacement uses no ACP systemPrompt append')
   assert.match(turns[3].text, HISTORY, 'the replacement session receives a history replay')
   assert.ok(turns[3].text.includes('warm the session'), `the replay carries the first round: ${turns[3].text}`)
   assert.ok(turns[3].text.includes('fix the quota display'), 'the replay also carries the live request')
   assert.ok(!turns[3].text.includes(NOTICE), 'the escaped reroll is never a bare continuation notice')
-  assert.ok(turns[3].system.includes('[reanswer:'), `the replayed system carries the reanswer tag: ${turns[3].system}`)
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 2, 'exactly one replacement session/new is opened')
 })
 

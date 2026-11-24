@@ -8,6 +8,8 @@
  * the conversation objects stay with the runtime, which passes in only the
  * facts a decision needs.
  * @module dsh-llm-antigravity-acp/tool-bridge
+
+
  */
 
 import { lstatSync, readlinkSync, realpathSync } from 'node:fs'
@@ -55,7 +57,7 @@ export function filterToolsForEngineMode(
   engineMode: EngineMode,
 ): ToolSchema[] {
   if (tools === undefined || tools.length === 0) return []
-  if (engineMode === 'bridge' || engineMode === 'safe-bridge') return [...tools]
+  if (engineMode === 'bridge') return [...tools]
   return tools.filter(tool => !NATIVE_OVERLAPPING_DSH_TOOLS.has(tool.name))
 }
 
@@ -63,6 +65,8 @@ export function filterToolsForEngineMode(
 export interface ReportedToolCall {
   kind?: string
   serverName?: string
+  /** Eight-hex ACP server suffix, retained for report/permission identity matching. */
+  serverScope?: string
   toolName?: string
   name?: string
   title?: string
@@ -90,46 +94,43 @@ function nonEmpty(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-const SCOPED_SERVER_RE = new RegExp(`^${escapeRegExp(MCP_SERVER_NAME)}(?:_[0-9a-f]{8})?$`, 'i')
-const SCOPED_TOOL_PREFIX_RE = new RegExp(`^(?:mcp_)?${escapeRegExp(MCP_SERVER_NAME)}(?:_[0-9a-f]{8})?_(.+)$`, 'i')
-
-/**
- * Whether a reported MCP server name belongs to our DSH bridge, accepting both
- * `dsh` (agy <= 1.5.14) and `dsh_<8-hex-session-hash>` (agy >= 1.5.15).
- */
-export function isBridgeServerName(serverName: string | undefined): boolean {
-  return serverName !== undefined && SCOPED_SERVER_RE.test(serverName)
-}
-
-/**
- * Strip `mcp_dsh_`, `mcp_dsh_<8hex>_`, `dsh_`, or `dsh_<8hex>_` from a tool identifier.
- */
-export function stripAgentToolPrefix(rawName: string): string {
-  const match = SCOPED_TOOL_PREFIX_RE.exec(rawName.trim())
-  return match?.[1] ?? rawName.trim()
-}
-
-function parseAgentMcpName(name: string | undefined): { serverName: string; toolName: string } | undefined {
+function parseBridgeServerName(name: string | undefined): { serverName: string; serverScope?: string } | undefined {
   if (name === undefined) return undefined
-  // Support both `mcp_dsh_<tool>` (agy 1.5.8–1.5.14) and `mcp_dsh_<8hex>_<tool>` (agy 1.5.15+).
-  if (!name.startsWith(AGENT_TOOL_PREFIX)) return undefined
-  const rest = name.slice(AGENT_TOOL_PREFIX.length)
-  if (rest.length === 0) return undefined
-  const scoped = /^([0-9a-f]{8})_(.+)$/i.exec(rest)
-  if (scoped !== null && scoped[2] !== undefined && scoped[2].length > 0) {
-    return { serverName: MCP_SERVER_NAME, toolName: scoped[2] }
+  const match = /^dsh(?:_([0-9a-f]{8}))?$/i.exec(name)
+  if (match === null) return undefined
+  return { serverName: MCP_SERVER_NAME, ...(match[1] !== undefined ? { serverScope: match[1].toLowerCase() } : {}) }
+}
+
+/** Whether a reported MCP server name belongs to this bridge, with or without agy's eight-hex session suffix. */
+export function isBridgeServerName(serverName: string | undefined): boolean {
+  return parseBridgeServerName(serverName) !== undefined
+}
+
+function parseAgentMcpName(name: string | undefined): { serverName: string; serverScope?: string; toolName: string } | undefined {
+  if (name === undefined) return undefined
+  const match = /^mcp_dsh_(?:([0-9a-f]{8})_)?(.+)$/i.exec(name)
+  if (match === null || match[2] === undefined || match[2].length === 0) return undefined
+  return {
+    serverName: MCP_SERVER_NAME,
+    ...(match[1] !== undefined ? { serverScope: match[1].toLowerCase() } : {}),
+    toolName: match[2],
   }
-  return { serverName: MCP_SERVER_NAME, toolName: rest }
+}
+
+/** Remove only an MCP namespace or explicit eight-hex server scope; canonical `dsh_*` tool names remain intact. */
+export function stripAgentToolPrefix(rawName: string, canonicalToolNames?: ReadonlySet<string>): string {
+  const name = rawName.trim()
+  if (canonicalToolNames?.has(name)) return name
+  const parsed = parseAgentMcpName(name)
+  if (parsed !== undefined) return parsed.toolName
+  const scoped = /^dsh_([0-9a-f]{8})_(.+)$/i.exec(name)
+  return scoped?.[2] ?? name
 }
 
 /**
  * Extract structured MCP tool identity from explicit metadata fields or the
- * agent's protocol tool `name` (`mcp_dsh_<tool>` or `mcp_dsh_<8hex>_<tool>`),
- * flagging contradictions between the two. `rawInput` is deliberately never consulted.
+ * agent's protocol tool `name` (`mcp_dsh_<tool>`), flagging contradictions
+ * between the two. `title` and `rawInput` are deliberately never consulted.
  */
 function extractMcpIdentity(
   carrier: {
@@ -138,7 +139,7 @@ function extractMcpIdentity(
     name?: unknown
     _meta?: AcpToolCallMeta
   } | undefined,
-): { serverName?: string; toolName?: string; name?: string; conflict?: boolean } {
+): { serverName?: string; serverScope?: string; toolName?: string; name?: string; conflict?: boolean } {
   const meta: AcpToolCallMeta | undefined = carrier?._meta
   const nestedMcp = meta !== undefined && typeof meta.mcp === 'object' && meta.mcp !== null
     ? meta.mcp as Record<string, unknown>
@@ -148,28 +149,86 @@ function extractMcpIdentity(
     ?? nonEmpty(meta?.serverName)
     ?? nonEmpty(meta?.server)
     ?? nonEmpty(nestedMcp?.server)
-  const explicitServer = isBridgeServerName(rawExplicitServer) ? MCP_SERVER_NAME : rawExplicitServer
+  const parsedServer = parseBridgeServerName(rawExplicitServer)
+  const explicitServer = parsedServer?.serverName ?? rawExplicitServer
   const rawExplicitTool = nonEmpty(carrier?.mcpToolName)
     ?? nonEmpty(meta?.mcpToolName)
     ?? nonEmpty(meta?.toolName)
     ?? nonEmpty(meta?.tool)
     ?? nonEmpty(nestedMcp?.tool)
-  const explicitTool = rawExplicitTool !== undefined && rawExplicitTool.startsWith(AGENT_TOOL_PREFIX)
-    ? (parseAgentMcpName(rawExplicitTool)?.toolName ?? rawExplicitTool)
-    : rawExplicitTool
-  const name = nonEmpty(carrier?.name) ?? nonEmpty(meta?.name)
-  // agy >= 1.5.8 reports `name: "mcp_dsh_<tool>"` or `"mcp_dsh_<8hex>_<tool>"` without `_meta`.
-  const parsed = parseAgentMcpName(name)
-  const conflict = (parsed !== undefined && explicitServer !== undefined && explicitServer !== parsed.serverName)
-    || (parsed !== undefined && explicitTool !== undefined && explicitTool !== parsed.toolName)
-  const serverName = explicitServer ?? parsed?.serverName
-  const toolName = explicitTool ?? parsed?.toolName
+  const parsedExplicitTool = parseAgentMcpName(rawExplicitTool)
+  const explicitTool = parsedExplicitTool?.toolName ?? rawExplicitTool
+  const rawName = nonEmpty(carrier?.name) ?? nonEmpty(meta?.name)
+  const parsedName = parseAgentMcpName(rawName)
+  const scopes = [parsedServer?.serverScope, parsedExplicitTool?.serverScope, parsedName?.serverScope].filter((scope): scope is string => scope !== undefined)
+  const distinctScopes = new Set(scopes)
+  const conflict = (parsedName !== undefined && explicitTool !== undefined && explicitTool !== parsedName.toolName)
+    || (parsedName !== undefined && explicitServer !== undefined && explicitServer !== parsedName.serverName)
+    || (parsedExplicitTool !== undefined && explicitServer !== undefined && explicitServer !== parsedExplicitTool.serverName)
+    || distinctScopes.size > 1
+  const serverName = explicitServer ?? parsedName?.serverName ?? parsedExplicitTool?.serverName
+  const serverScope = parsedServer?.serverScope ?? parsedExplicitTool?.serverScope ?? parsedName?.serverScope
+  const toolName = explicitTool ?? parsedName?.toolName
+  const name = parsedName === undefined ? rawName : `${AGENT_TOOL_PREFIX}${parsedName.toolName}`
   return {
     ...(serverName !== undefined ? { serverName } : {}),
+    ...(serverScope !== undefined ? { serverScope } : {}),
     ...(toolName !== undefined ? { toolName } : {}),
     ...(name !== undefined ? { name } : {}),
     ...(conflict ? { conflict: true } : {}),
   }
+}
+
+/** Remove agy's synthetic `toolSummary` argument unless the selected schema declares it. */
+export function sanitizeMcpToolArguments(rawArgs: unknown, schema: ToolSchema | undefined): Record<string, unknown> {
+  if (rawArgs === null || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) return {}
+  const args = { ...(rawArgs as Record<string, unknown>) }
+  const properties = schema?.parameters.properties
+  const declaresSummary = properties !== null
+    && typeof properties === 'object'
+    && !Array.isArray(properties)
+    && Object.prototype.hasOwnProperty.call(properties, 'toolSummary')
+  if (!declaresSummary) delete args.toolSummary
+  return args
+}
+
+function renderShortType(node: unknown, depth = 0): string {
+  if (depth > 3 || node === null || typeof node !== 'object' || Array.isArray(node)) return 'any'
+  const schema = node as Record<string, unknown>
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum.slice(0, 6).map(value => JSON.stringify(value)).join('|')
+  const union = Array.isArray(schema.anyOf) ? schema.anyOf : (Array.isArray(schema.oneOf) ? schema.oneOf : undefined)
+  if (union !== undefined && union.length > 0) return [...new Set(union.slice(0, 6).map(value => renderShortType(value, depth + 1)))].join('|') || 'any'
+  if (schema.type === 'array') return `${schema.items !== undefined ? renderShortType(schema.items, depth + 1) : 'any'}[]`
+  if (typeof schema.type === 'string') return schema.type
+  if (Array.isArray(schema.type)) return schema.type.filter((value): value is string => typeof value === 'string').join('|') || 'any'
+  return 'any'
+}
+
+/** Render the exact parameter names, required markers, and schema types for one tool. */
+export function renderToolSignature(tool: ToolSchema): string {
+  const parameters = tool.parameters as { properties?: unknown; required?: unknown }
+  const properties = parameters.properties !== null && typeof parameters.properties === 'object' && !Array.isArray(parameters.properties)
+    ? parameters.properties as Record<string, unknown>
+    : {}
+  const requiredList = Array.isArray(parameters.required) ? parameters.required.filter((key): key is string => typeof key === 'string') : []
+  const required = new Set(requiredList)
+  const ordered = [
+    ...requiredList.filter((key, index) => requiredList.indexOf(key) === index),
+    ...Object.keys(properties).filter(key => !required.has(key)),
+  ]
+  const rendered = ordered.map(name => `${name}${required.has(name) ? '' : '?'}: ${renderShortType(properties[name])}`)
+  return `${tool.name}(${rendered.join(', ')})`
+}
+
+/** Return a repair message when an MCP call omits required DSH parameters. */
+export function validateRequiredToolArguments(schema: ToolSchema | undefined, args: Record<string, unknown>): string | undefined {
+  if (schema === undefined) return undefined
+  const required = schema.parameters.required
+  if (!Array.isArray(required) || required.length === 0) return undefined
+  const missing = required.filter((key): key is string => typeof key === 'string' && (!Object.prototype.hasOwnProperty.call(args, key) || args[key] === undefined))
+  return missing.length === 0
+    ? undefined
+    : `Invalid arguments for tool ${schema.name}: missing required parameter(s): ${missing.join(', ')}. Expected signature: ${renderToolSignature(schema)}`
 }
 
 /**
@@ -185,7 +244,7 @@ export function recordReportedToolCall(
 ): 'created' | 'merged' | 'conflict' | undefined {
   if (update.sessionUpdate !== 'tool_call' && update.sessionUpdate !== 'tool_call_update') return
   if (typeof update.toolCallId !== 'string' || update.toolCallId.length === 0) return
-  const { serverName, toolName, name, conflict: selfConflict } = extractMcpIdentity(update)
+  const { serverName, serverScope, toolName, name, conflict: selfConflict } = extractMcpIdentity(update)
   const title = nonEmpty(update.title)
   const kind = typeof update.kind === 'string' ? update.kind : undefined
   const existing = conv.reportedToolCalls.get(update.toolCallId)
@@ -198,6 +257,10 @@ export function recordReportedToolCall(
   if (serverName !== undefined) {
     if (merged.serverName !== undefined && merged.serverName !== serverName) conflict = true
     else merged.serverName = serverName
+  }
+  if (serverScope !== undefined) {
+    if (merged.serverScope !== undefined && merged.serverScope !== serverScope) conflict = true
+    else merged.serverScope = serverScope
   }
   if (toolName !== undefined) {
     if (merged.toolName !== undefined && merged.toolName !== toolName) conflict = true
@@ -454,7 +517,7 @@ export function answerPermission(
   if (typeof toolCallId !== 'string' || toolCallId.length === 0) return reject('missing toolCallId')
   const reported = state.reportedToolCalls.get(toolCallId)
   const claimed = extractMcpIdentity(request.toolCall)
-  const engineMode = state.engineMode ?? 'safe-bridge'
+  const engineMode = state.engineMode ?? 'bridge'
   if (engineMode === 'native') {
     const isProbe = reported === undefined
       && claimed.serverName === undefined
@@ -490,10 +553,12 @@ export function answerPermission(
     return reject(`permission request for tool call ${toolCallId} carries conflicting MCP metadata`)
   }
   if (claimed.serverName !== undefined && claimed.serverName !== reported.serverName) return reject('MCP server name conflict')
+  if (claimed.serverScope !== undefined && reported.serverScope !== undefined && claimed.serverScope !== reported.serverScope) return reject('MCP server scope conflict')
   if (claimed.toolName !== undefined && claimed.toolName !== reported.toolName) return reject('tool name conflict')
   if (claimed.name !== undefined && reported.name !== undefined && claimed.name !== reported.name) return reject('tool name conflict')
-  if (reported.serverName !== MCP_SERVER_NAME && !isBridgeServerName(reported.serverName)) return reject(`unknown MCP server ${reported.serverName ?? '(none)'}`)
+  if (reported.serverName !== MCP_SERVER_NAME) return reject(`unknown MCP server ${reported.serverName ?? '(none)'}`)
   const allowedTools = new Set([...state.advertisedToolNames, AWAIT_TOOL_NAME, CALL_TOOL_NAME])
+  if (engineMode === 'bridge') allowedTools.add(READ_TOOL_RESULT_NAME)
   if (reported.toolName === undefined || !allowedTools.has(reported.toolName)) {
     return reject(`tool is not offered to this session: ${reported.toolName ?? '(none)'}`)
   }
@@ -642,7 +707,7 @@ function cloakSchemaDescriptions(value: unknown): unknown {
 export function toBridgeTools(tools: readonly ToolSchema[] | undefined, mode?: EngineMode): BridgeTool[] {
   return (tools ?? []).filter(t => t.deferLoading !== true).map((t) => {
     const parameters = t.parameters.type === undefined ? { type: 'object', ...t.parameters } : t.parameters
-    if (mode === 'bridge' || mode === 'safe-bridge') {
+    if (mode === 'bridge') {
       const description = t.name === 'read' ? `${t.description} ${READ_PAGING_NOTE}` : t.description
       return { name: t.name, description, inputSchema: parameters, _meta: { 'antigravity/alwaysLoad': true } }
     }
@@ -655,114 +720,27 @@ export function toBridgeTools(tools: readonly ToolSchema[] | undefined, mode?: E
   })
 }
 
-/**
- * Strip `agy`-injected metadata fields (such as `toolSummary`) from incoming
- * MCP tool arguments unless the target DSH tool explicitly declares them,
- * preserving strict JSON Schema (`additionalProperties: false`) compatibility.
- * @param rawArgs - parsed arguments from `tools/call`.
- * @param schema - active DSH tool schema, if known.
- * @returns sanitized arguments object.
- */
-export function sanitizeMcpToolArguments(
-  rawArgs: unknown,
-  schema: ToolSchema | undefined,
-): Record<string, unknown> {
-  if (rawArgs === null || typeof rawArgs !== 'object' || Array.isArray(rawArgs)) return {}
-  const copy: Record<string, unknown> = { ...(rawArgs as Record<string, unknown>) }
-  if ('toolSummary' in copy) {
-    const props = (schema?.parameters as { properties?: unknown } | undefined)?.properties
-    const declaresToolSummary = props !== null
-      && typeof props === 'object'
-      && !Array.isArray(props)
-      && Object.prototype.hasOwnProperty.call(props, 'toolSummary')
-    if (!declaresToolSummary) {
-      delete copy.toolSummary
-    }
-  }
-  return copy
-}
-
-function renderShortType(node: unknown, depth = 0): string {
-  if (depth > 3 || node === null || typeof node !== 'object' || Array.isArray(node)) return 'any'
-  const rec = node as Record<string, unknown>
-  if (Array.isArray(rec.enum) && rec.enum.length > 0) {
-    return rec.enum.slice(0, 6).map(v => JSON.stringify(v)).join('|')
-  }
-  const union = Array.isArray(rec.anyOf) ? rec.anyOf : (Array.isArray(rec.oneOf) ? rec.oneOf : undefined)
-  if (union !== undefined && union.length > 0) {
-    const rendered = [...new Set(union.slice(0, 6).map(item => renderShortType(item, depth + 1)))]
-    return rendered.join('|') || 'any'
-  }
-  if (rec.type === 'array') {
-    const itemType = rec.items !== undefined ? renderShortType(rec.items, depth + 1) : 'any'
-    return `${itemType}[]`
-  }
-  if (typeof rec.type === 'string') return rec.type
-  if (Array.isArray(rec.type)) return rec.type.filter((t): t is string => typeof t === 'string').join('|') || 'any'
-  return 'any'
-}
-
-/**
- * Render one compact tool signature such as `read(file_path: string, offset?: number)`.
- * @param tool - DSH tool schema.
- * @returns compact one-line signature.
- */
-export function renderToolSignature(tool: ToolSchema): string {
-  const params = tool.parameters as { properties?: Record<string, unknown>; required?: unknown }
-  const props = params.properties !== null && typeof params.properties === 'object' && !Array.isArray(params.properties)
-    ? params.properties
-    : {}
-  const requiredList = Array.isArray(params.required)
-    ? params.required.filter((k): k is string => typeof k === 'string')
-    : []
-  const required = new Set(requiredList)
-  const ordered = [
-    ...requiredList.filter((k, i) => requiredList.indexOf(k) === i),
-    ...Object.keys(props).filter(k => !required.has(k)),
-  ]
-  const rendered = ordered.map(name => `${name}${required.has(name) ? '' : '?'}: ${renderShortType(props[name])}`)
-  return `${tool.name}(${rendered.join(', ')})`
-}
-
-/**
- * Render compact tool signatures for all active DSH tools.
- * @param tools - active DSH tool schemas.
- * @returns formatted signature list, or empty string when no tools are active.
- */
-export function renderToolSignatures(tools: readonly ToolSchema[] | undefined): string {
-  if (tools === undefined || tools.length === 0) return ''
-  const visible = tools.filter(t => t.deferLoading !== true)
-  if (visible.length === 0) return ''
-  return [
-    'Active harness tool parameter signatures (use exact parameter names; parameters without `?` are required):',
-    ...visible.map(t => `- ${renderToolSignature(t)}`),
-  ].join('\n')
-}
-
-/**
- * Validate that every required parameter declared in a DSH tool schema is
- * present before parking the call, returning an actionable signature error when
- * any required key is missing.
- * @param schema - active DSH tool schema.
- * @param args - sanitized call arguments.
- * @returns an error message string when invalid, or `undefined` when valid.
- */
-export function validateRequiredToolArguments(
-  schema: ToolSchema | undefined,
-  args: Record<string, unknown>,
-): string | undefined {
-  if (schema === undefined) return undefined
-  const required = (schema.parameters as { required?: unknown }).required
-  if (!Array.isArray(required) || required.length === 0) return undefined
-  const missing = required.filter(
-    (key): key is string => typeof key === 'string' && (!Object.prototype.hasOwnProperty.call(args, key) || args[key] === undefined),
-  )
-  if (missing.length === 0) return undefined
-  return `Invalid arguments for tool ${schema.name}: missing required parameter(s): ${missing.join(', ')}. Expected signature: ${renderToolSignature(schema)}`
-}
-
 /** UTF-8 ceiling of one MCP tool result, below `agy`'s 10,240-byte `outputTruncationTool` middle splice. */
 export const MAX_BRIDGE_RESULT_BYTES = 9_600
+/** MCP helper used to page through text retained from a truncated tool result. */
+export const READ_TOOL_RESULT_NAME = 'dsh_read_tool_result'
+/** Maximum UTF-8 bytes returned by one read of a retained tool result. */
+export const MAX_TOOL_RESULT_PAGE_BYTES = 8_000
+/** MCP descriptor for paging text from a prior truncated result in this session. */
+export const READ_TOOL_RESULT: BridgeTool = {
+  name: READ_TOOL_RESULT_NAME,
+  description: 'Read one UTF-8 byte page from a text tool result in this DSH conversation. Use this for truncated result text; it is read-only and does not rerun the source tool. Use the result_id and next_offset from the truncation notice or prior page; page limit is at most 8000 bytes.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      result_id: { type: 'string', description: 'The tool call id shown in the truncation notice.' },
+      part: { type: 'integer', minimum: 0, description: 'Zero-based text part index shown in the truncation notice.' },
+      offset: { type: 'integer', minimum: 0, description: 'UTF-8 byte offset; use the next_offset returned by the prior page.' },
+      limit: { type: 'integer', minimum: 4, maximum: MAX_TOOL_RESULT_PAGE_BYTES, description: 'Maximum UTF-8 bytes to return; default page size is 8000.' },
+    },
+    required: ['result_id', 'part', 'offset', 'limit'],
+  },
+}
 /** Page size the bounded `read` notice and the `read` descriptor recommend. */
 export const READ_PAGE_LINES = 160
 /** Sentence appended to the `read` descriptor. */
@@ -787,6 +765,53 @@ function withReadPagingNote(tool: BridgeTool): BridgeTool {
 
 function utf8Bytes(text: string): number {
   return Buffer.byteLength(text, 'utf8')
+}
+
+/** The text budget used by {@link boundBridgeContent} after its reserved suffix. */
+export function bridgeTextBudgetBytes(reservedBytes = 0): number {
+  return Math.max(MAX_BRIDGE_RESULT_BYTES / 4, MAX_BRIDGE_RESULT_BYTES - reservedBytes)
+}
+
+/** One code-point-aligned page of retained UTF-8 text. */
+export interface Utf8TextPage {
+  text: string
+  startOffset: number
+  endOffset: number
+  totalBytes: number
+  nextOffset: number | undefined
+}
+
+/** Result of validating and slicing a retained text page. */
+export type Utf8TextPageResult =
+  | { ok: true; page: Utf8TextPage }
+  | { ok: false; error: 'invalid-limit' | 'invalid-offset' | 'offset-out-of-range' }
+
+/**
+ * Slice one retained text page using UTF-8 byte cursors without splitting a code point.
+ * @param text - original text for one content part.
+ * @param offset - zero-based UTF-8 byte offset.
+ * @param limit - requested byte maximum.
+ * @returns the page and next cursor, or a validation error.
+ */
+export function pageUtf8Text(text: string | Buffer, offset: number, limit: number): Utf8TextPageResult {
+  if (!Number.isInteger(limit) || limit < 4 || limit > MAX_TOOL_RESULT_PAGE_BYTES) return { ok: false, error: 'invalid-limit' }
+  if (!Number.isInteger(offset) || offset < 0) return { ok: false, error: 'invalid-offset' }
+  const bytes = typeof text === 'string' ? Buffer.from(text, 'utf8') : text
+  if (offset > bytes.length) return { ok: false, error: 'offset-out-of-range' }
+  if (offset < bytes.length && ((bytes[offset] ?? 0) & 0xc0) === 0x80) return { ok: false, error: 'invalid-offset' }
+  let endOffset = Math.min(bytes.length, offset + limit)
+  while (endOffset > offset && endOffset < bytes.length && ((bytes[endOffset] ?? 0) & 0xc0) === 0x80) endOffset--
+  const textPage = bytes.subarray(offset, endOffset).toString('utf8')
+  return {
+    ok: true,
+    page: {
+      text: textPage,
+      startOffset: offset,
+      endOffset,
+      totalBytes: bytes.length,
+      nextOffset: endOffset < bytes.length ? endOffset : undefined,
+    },
+  }
 }
 
 /** Longest prefix of `text` within `maxBytes` UTF-8 bytes that never splits a code point. */
@@ -933,7 +958,7 @@ function boundHeadTail(text: string, totalBytes: number, maxBytes: number): stri
  * @returns the bounded content items.
  */
 export function boundBridgeContent(toolName: string, items: readonly BridgeContent[], reservedBytes = 0, isError = false): BridgeContent[] {
-  const budget = Math.max(MAX_BRIDGE_RESULT_BYTES / 4, MAX_BRIDGE_RESULT_BYTES - reservedBytes)
+  const budget = bridgeTextBudgetBytes(reservedBytes)
   const texts = items.flatMap(item => item.type === 'text' ? [item.text] : [])
   if (texts.reduce((sum, text) => sum + utf8Bytes(text), 0) <= budget) return [...items]
   // An empty name selects the head-and-tail strategy.

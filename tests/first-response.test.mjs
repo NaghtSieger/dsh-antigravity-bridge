@@ -4,10 +4,14 @@ import { test } from 'node:test'
 import { AcpTurn } from '../lib/conversation.js'
 import { AntigravityRuntime } from '../lib/runtime.js'
 
+
 function setup(t, watched = true) {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const turn = new AcpTurn('fixture')
-  const conv = { sessionId: 'fixture', promptGen: 0, turn, toolNames: new Set(['write']) }
+  const conv = {
+    sessionId: 'fixture', promptGen: 0, turn, toolNames: new Set(['write']),
+    activeToolSchemas: new Map([['write', { name: 'write', parameters: { type: 'object', properties: {} } }]]),
+  }
   const abort = new AbortController()
   const cancelled = []
   let finish

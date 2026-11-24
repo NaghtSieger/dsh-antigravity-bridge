@@ -1,7 +1,8 @@
 
+
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { inputPrompt, partitionBridgePrompt, prepareBridgeInput, promptTextBytes, replayPrompt, splitReplay, splitSystem } from '../lib/history.js'
+import { inputPrompt, replayPrompt, splitReplay, splitSystem } from '../lib/history.js'
 
 const block = { type: 'plugin-fixture', data: { file: 'C:\\a b\\DEMO_01', flag: false } }
 const user = (id, text) => ({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
@@ -62,45 +63,25 @@ test('assistant text around a historical tool call keeps its position', async ()
   assert.ok(order.every((x,i)=>x>=0 && (i===0 || x>order[i-1])))
 })
 
-test('partitionBridgePrompt stages multi-segment guidelines and history safely on UTF-8 boundaries', () => {
-  const limit = 1024
-  const seg1 = { kind: 'context', text: `<workspace_guidelines>\n${'规则line\n'.repeat(80)}</workspace_guidelines>\n\n` }
-  const seg2 = { kind: 'history', text: `<dsh_history>\n${'🟢中文'.repeat(200)}\n</dsh_history>\n\n` }
-  const live = [{ type: 'text', text: 'FINAL_Q' }, { type: 'image', data: 'w6k=', mimeType: 'image/png' }]
-  const { parts, final } = partitionBridgePrompt([seg1, seg2], live, limit)
-  assert.ok(parts.length >= 2)
-  assert.ok(parts.every(part => Buffer.byteLength(part, 'utf8') <= limit))
-  assert.ok(promptTextBytes(final) <= limit)
-  assert.deepEqual(final.at(-1), live[1])
-  assert.ok(final.some(block => block.type === 'text' && block.text.includes('FINAL_Q')))
-  assert.ok(!parts.some(part => part.includes('FINAL_Q')))
-
-  // Multi-segment case where each segment individually fits inside capacity while combined exceeds limit
-  const fitSeg1 = { kind: 'context', text: 'A'.repeat(600) }
-  const fitSeg2 = { kind: 'history', text: 'B'.repeat(600) }
-  const res = partitionBridgePrompt([fitSeg1, fitSeg2], [{ type: 'text', text: 'LIVE' }], 1024)
-  assert.equal(res.parts.length, 1)
-  assert.ok(res.parts[0].includes('A'.repeat(600)))
-  assert.ok(promptTextBytes(res.final) <= 1024)
-  assert.ok(res.final.some(b => b.type === 'text' && b.text.includes('B'.repeat(600))))
-
-  // Oversized live input returns no staged parts so caller can reject without calling the model
-  const over = partitionBridgePrompt([fitSeg1], [{ type: 'text', text: 'X'.repeat(1500) }], 1024)
-  assert.equal(over.parts.length, 0)
-})
-
-test('prepareBridgeInput separates leading and oversized trailing stageable context from human input', async () => {
-  const emptyDev = { id: 'e', role: 'developer', content: [] }
-  const sys = { id: 's', role: 'system', content: [{ type: 'text', text: 'SYS_BODY' }] }
-  const human = user('u', 'HUMAN_Q')
-  const bigPlugin = { id: 'p', role: 'user', source: { kind: 'plugin:test' }, content: [{ type: 'text', text: 'P'.repeat(2000) }] }
-  const res = await prepareBridgeInput([sys, human, bigPlugin], noImage, { limit: 1024 })
-  assert.ok(res.stageableText.includes('<system_update>\nSYS_BODY\n</system_update>'))
-  assert.ok(res.stageableText.includes('P'.repeat(2000)))
-  assert.equal(text(res.liveBlocks), 'HUMAN_Q')
-
-  // Empty-content stageable messages must not inject a spurious 'Continue.' text
-  const emptyRes = await prepareBridgeInput([emptyDev, human], noImage, { limit: 1024 })
-  assert.equal(emptyRes.stageableText, '')
-  assert.equal(text(emptyRes.liveBlocks), 'HUMAN_Q')
+test('large updates preserve inline order, Unicode bytes, and the live question and image', async () => {
+  const payload = '开始🟢' + '变更'.repeat(260) + '末尾'
+  const update = {role:'system',id:'late',content:[{type:'text',text:payload}]}
+  const picture = {type:'image',attachment:{attachmentId:'pixel'}}
+  const msgs = [user('a','LIVE_BEFORE'),update,{...user('b','LIVE_AFTER'),content:[{type:'text',text:'LIVE_AFTER'},picture]}]
+  const blocks = await inputPrompt(msgs,async()=>({data:'abc',mimeType:'image/png'}))
+  const {parts,final} = splitReplay(blocks,false,600)
+  assert.ok(parts.length > 1)
+  assert.ok(parts.every(p=>Buffer.byteLength(p)<=600 && !p.includes('LIVE_')))
+  const ref = /\[Insert staged context ([0-9a-f]+) here\.\]/.exec(text(final))
+  assert.ok(ref)
+  assert.ok(parts.every(p=>p.startsWith('Context attachment '+ref[1]+',')))
+  assert.equal(parts.map(p=>p.slice(p.indexOf('\n\n')+2)).join(''),blocks[2].text)
+  assert.equal(text(final).replace(ref[0],blocks[2].text),text(blocks))
+  assert.deepEqual(final.at(-1),blocks.at(-1))
+  const pre = await inputPrompt([update,user('a','LIVE')],noImage)
+  const staged = splitReplay(pre,false,600)
+  assert.equal(staged.parts.map(p=>p.slice(p.indexOf('\n\n')+2)).join(''),pre[0].text)
+  assert.equal(text(staged.final).trim(),'LIVE')
+  const oversize = await inputPrompt([update,user('a','U'.repeat(601))],noImage)
+  assert.deepEqual(splitReplay(oversize,false,600),{parts:[],final:oversize})
 })

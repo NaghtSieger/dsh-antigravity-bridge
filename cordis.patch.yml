@@ -1,11 +1,7 @@
 # Bundle layer: mount the Antigravity provider beside the existing providers.
-# Defaults to `safe-bridge` (untouched official systemInstruction + ACP-level
-# disabled built-in tools + 100% DSH-owned MCP tools + attempt-1 429 circuit breaker).
+# Volatile fields (contextWindow, defaultEffort, longDecodeContinuations)
+# are edited live from the Plugins settings page.
 - insert:
     - id: llm-antigravity-acp
       name: dsh-llm-antigravity-acp
       inject: [llm, subprocess]
-      config:
-        engineMode: safe-bridge
-        circuitBreakerOn429: true
-        autoPatch: false

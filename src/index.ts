@@ -1,5 +1,6 @@
 
 
+
 /**
  * DeepSeek Harness primary-model provider for Google Antigravity.
  *
@@ -157,7 +158,6 @@ export function apply(ctx: Context, config: Config): void {
     ...(config.hiddenModels !== undefined ? { hiddenModels: config.hiddenModels } : {}),
     degradeAction: config.degradeAction,
     engineMode: config.engineMode,
-    ...(config.circuitBreakerOn429 !== undefined ? { circuitBreakerOn429: config.circuitBreakerOn429 } : {}),
     displayName: config.displayName,
     modelDisplayNames: config.modelDisplayNames,
   }
@@ -212,7 +212,7 @@ export function apply(ctx: Context, config: Config): void {
       const image = await store.readImageRequest(ref, { width: ref.width, height: ref.height, maxBytes: REQUEST_IMAGE_MAX_BYTES })
       return { data: Buffer.from(image.data).toString('base64'), mimeType: image.mediaType }
     } catch (error) {
-      ctx.logger.warn(`antigravity-acp: failed to read image attachment ${ref.attachmentId}: ${error instanceof Error ? error.message : String(error)}`)
+      ctx.logger.warn(`antigravity-acp: could not read image ${ref.attachmentId}: ${error instanceof Error ? error.message : String(error)}`)
       return undefined
     }
   }

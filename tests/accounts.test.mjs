@@ -1,6 +1,7 @@
 
 // Unit tests of the account pool: isolation layout, environment overlay,
 // configuration preparation, and scheduling.
+
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
@@ -107,7 +108,8 @@ test('ensureLayout prepares only configuration, leaving the official CLI credent
   const original = join(cliHome, 'antigravity-oauth-token')
   writeFileSync(original, 'synthetic official CLI credential')
   ensureLayout(work)
-  assert.ok(existsSync(join(work.geminiDir, 'config', 'plugins', 'dsh-bridge', 'agents', 'dsh-bridge.md')))
+  assert.ok(existsSync(join(work.geminiDir, 'config', 'plugins', 'dsh-bridge-scoped', 'agents', 'dsh-bridge-scoped.md')))
+  assert.equal(existsSync(join(work.geminiDir, 'config', 'plugins', 'dsh-bridge', 'agents', 'dsh-bridge.md')), false)
   assert.equal(existsSync(join(work.appDir, 'antigravity-oauth-token')), false)
   assert.equal(existsSync(join(work.homeDir, 'Library', 'Keychains')), false)
   assert.equal(readFileSync(original, 'utf8'), 'synthetic official CLI credential')

@@ -1,4 +1,5 @@
 
+
 /**
  * One long-lived `agy acp` front process. With `--process-per-session` the
  * front serves every ACP session from an isolated worker, so the main
@@ -12,7 +13,6 @@ import type { Readable, Writable } from 'node:stream'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { AcpTurn } from './conversation.ts'
 import { JsonRpcPeer, JsonRpcRemoteError } from './jsonrpc.ts'
-import { labeled } from './labels.ts'
 
 /** Minimal handle of a spawned ACP process. */
 export interface AcpChild {
@@ -260,6 +260,13 @@ export class AcpProcess {
     signal?.throwIfAborted()
     const receipt = new AcpTurn('history')
     const deadline = new AbortController()
+    // 历史交接也沿同一取消路径结束。
+    let cancelledForRate = false
+    receipt.cancelRateRetry = () => {
+      cancelledForRate = true
+      this.cancel(sessionId)
+    }
+    receipt.onRateRetry = message => deadline.abort(new Error(message))
     receipt.waitForFirstResponse(() => deadline.abort(receipt.agentFailure ?? new Error('No first response during history handoff')))
     const stop = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
     this.listeners.set(sessionId, {
@@ -279,16 +286,15 @@ export class AcpProcess {
       }
       reply += receipt.recoverNoticeHold()
       if (receipt.agentFailure) throw receipt.agentFailure
-      const trimmedReply = reply.trim()
-      if (result.stopReason !== 'end_turn' || !/^[`"'*\s]*ACK[`"'*.\s!]*$/i.test(trimmedReply)) {
-        const preview = trimmedReply.length > 0 ? `: ${trimmedReply.slice(0, 80)}` : ''
-        throw new LlmError(
-          labeled('TRANSPORT', `History fragment was not acknowledged (${result.stopReason}${preview})`),
-          'TRANSPORT',
-        )
+      if (result.stopReason !== 'end_turn' || !/^[`"'*\s]*ACK[`"'*.!\s]*$/i.test(reply)) {
+        throw new LlmError(`History fragment was not acknowledged (${result.stopReason}): ${reply.trim().slice(0, 80)}`, 'TRANSPORT')
       }
     } catch (error) {
-      if (stop.aborted) this.cancel(sessionId)
+      if (stop.aborted && !cancelledForRate) this.cancel(sessionId)
+      if (cancelledForRate) {
+        receipt.recoverNoticeHold()
+        throw receipt.agentFailure ?? error
+      }
       throw error
     } finally {
       receipt.clearFirstResponseTimer()
