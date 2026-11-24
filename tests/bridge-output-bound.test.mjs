@@ -3,6 +3,7 @@
 // bridge bounds each result to 9,600 UTF-8 bytes first: a `read` keeps its
 // leading complete lines and tells the agent the next `offset`, every other tool
 // keeps a head and a tail around an explicit omission marker.
+
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -14,7 +15,8 @@ import { AntigravityAdapter } from '../lib/adapter.js'
 import { bridgeSystemPrompt } from '../lib/history.js'
 import { AntigravityRuntime } from '../lib/runtime.js'
 import {
-  boundBridgeContent, boundBridgeToolText, MAX_BRIDGE_RESULT_BYTES, MAX_EAGER_BRIDGE_TOOL_BYTES, READ_PAGING_NOTE, toBridgeTools,
+  boundBridgeContent, boundBridgeToolText, MAX_BRIDGE_RESULT_BYTES, MAX_EAGER_BRIDGE_TOOL_BYTES, MAX_TOOL_RESULT_PAGE_BYTES,
+  pageUtf8Text, READ_PAGING_NOTE, toBridgeTools,
 } from '../lib/tool-bridge.js'
 
 const bytes = text => Buffer.byteLength(text, 'utf8')
@@ -112,6 +114,30 @@ test('a smaller budget is honored exactly', () => {
     assert.ok(bytes(boundBridgeToolText('read', text, budget)) <= budget)
     assert.ok(bytes(boundBridgeToolText('grep', text, budget)) <= budget)
   }
+})
+
+test('UTF-8 result pages reconstruct a long single-line Unicode value and reject unsafe cursors', () => {
+  const text = '单行技能说明 ✅—权限与恢复。'.repeat(2_000)
+  assert.doesNotMatch(text, /\n/u)
+  const pages = []
+  const totalBytes = bytes(text)
+  let offset = 0
+  while (offset < totalBytes) {
+    const result = pageUtf8Text(text, offset, MAX_TOOL_RESULT_PAGE_BYTES)
+    assert.equal(result.ok, true)
+    const page = result.page
+    assert.equal(page.startOffset, offset)
+    assert.ok(bytes(page.text) <= MAX_TOOL_RESULT_PAGE_BYTES)
+    assert.ok(page.endOffset > offset)
+    assert.doesNotMatch(page.text, /\uFFFD/u)
+    pages.push(page.text)
+    offset = page.endOffset
+    assert.equal(page.nextOffset, offset < totalBytes ? offset : undefined)
+  }
+  assert.equal(pages.join(''), text)
+  assert.deepEqual(pageUtf8Text('😀', 1, 8), { ok: false, error: 'invalid-offset' })
+  assert.deepEqual(pageUtf8Text('end', 4, 8), { ok: false, error: 'offset-out-of-range' })
+  assert.deepEqual(pageUtf8Text('x', 0, 3), { ok: false, error: 'invalid-limit' })
 })
 
 test('boundBridgeContent bounds the text of a whole result and keeps images', () => {
@@ -214,7 +240,7 @@ test('toBridgeResult hands agy a paged read result below its 10,240-byte splice'
   const delivered = reply.slice('RESULT(read)='.length)
   assert.ok(bytes(delivered) <= MAX_BRIDGE_RESULT_BYTES, `agy received ${bytes(delivered)} bytes`)
   assert.ok(delivered.startsWith('<path>/w/src/big.ts</path>'))
-  assert.ok(delivered.endsWith('</content>'))
+  assert.match(delivered, /<\/content>\n\n\[The tool result text was truncated/u)
   assert.match(delivered, /mcp_dsh_read with offset=\d+ and limit=160/)
 })
 

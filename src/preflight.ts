@@ -8,8 +8,8 @@
  * Antigravity home that ACP sessions use.
  *
  * The isolated home keeps the user's global Antigravity rules, skills, and
- * MCP servers out of DSH sessions and installs the `dsh-bridge` agent, which
- * removes every built-in tool so the agent acts only through DSH tools.
+ * MCP servers out of DSH sessions. Bridge sessions use a dedicated scoped agent;
+ * the previous generated agent is retired without overwriting its remaining rules.
  * @module dsh-llm-antigravity-acp/preflight
  */
 
@@ -17,8 +17,10 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from 'no
 import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
 
-/** Agent id installed in the isolated home. */
-export const BRIDGE_AGENT = 'dsh-bridge'
+/** Dedicated scoped agent used by bridge-mode ACP processes. */
+export const BRIDGE_AGENT = 'dsh-bridge-scoped'
+/** Previous plugin-generated agent id retained only for safe retirement. */
+const LEGACY_BRIDGE_AGENT = 'dsh-bridge'
 /** Minimum official CLI version supporting `agy acp --process-per-session`. */
 export const MIN_AGY_VERSION: readonly [number, number, number] = [1, 4, 12]
 /** Default model display name pre-seeded into isolated `settings.json` files. */
@@ -184,29 +186,9 @@ export function defaultHome(): string {
  * @returns the empty workspace directory used as every session's cwd.
  */
 export function prepareHome(home: string, userHome: string = homedir()): string {
-  const agentDir = join(home, 'config', 'plugins', BRIDGE_AGENT, 'agents')
-  mkdirSync(agentDir, { recursive: true })
-  writeIfChanged(join(home, 'config', 'plugins', BRIDGE_AGENT, 'plugin.json'), `${JSON.stringify({ name: BRIDGE_AGENT }, null, 2)}\n`)
-  writeIfChanged(join(agentDir, `${BRIDGE_AGENT}.md`), [
-    '---',
-    `name: ${BRIDGE_AGENT}`,
-    'description: "Primary-model bridge: no built-in tools, harness tools only"',
-    'tools: []',
-    'excludeDefaultComponents: true',
-    'mainAgent: true',
-    '---',
-    "<identity>",
-    "You are working with a USER to solve their task.",
-    "The USER will send you requests, which you must always prioritize addressing. User requests are enclosed within <USER_REQUEST> tags.",
-    "</identity>",
-    "<guidelines>",
-    "Follow these behavioral guidelines at all times:",
-    "- Never defeat or bypass an access control, permission check, credential requirement, network/proxy restriction, or sandbox/environment boundary - including writing to the state or processes such a check reads, spoofing identity, intercepting the check, probing undocumented local/host services, or modifying host, harness, or test infrastructure outside your task scope. Use documented, sanctioned paths only; if none of them work, you are blocked - report the error and stop.",
-    "- Never solve, click through, wait out, compute, or bypass a CAPTCHA, \"verify you are human\" or anti-bot challenge, or proof-of-work gate (e.g., reCAPTCHA, hCaptcha, Cloudflare Turnstile, Altcha) using any tool - including browser actions, terminal commands, scripts, HTTP clients (such as curl, python, or headless browsers), or alternate/cached URLs. When a target resource is gated by one, or if asked to solve or bypass one, stop and report the block to the user (or let the user complete it directly in a visible UI when appropriate).",
-    "</guidelines>",
-    "Use the host session workspace, tools and approval policy for all project files, commands and deliverables.",
-    '',
-  ].join('\n'))
+
+  prepareScopedBridgeAgent(home)
+  retireLegacyBridgeMainAgent(home)
   const appData = join(home, 'agy')
   mkdirSync(join(appData, 'conversations'), { recursive: true })
   mkdirSync(join(home, 'antigravity', 'conversations'), { recursive: true })
@@ -222,6 +204,62 @@ export function prepareHome(home: string, userHome: string = homedir()): string 
   const workspace = join(home, 'workspace')
   mkdirSync(workspace, { recursive: true })
   return workspace
+}
+
+/** Retire the prior generated bridge agent while preserving its rules and permissions. */
+function retireLegacyBridgeMainAgent(home: string): void {
+  const agentPath = join(home, 'config', 'plugins', LEGACY_BRIDGE_AGENT, 'agents', `${LEGACY_BRIDGE_AGENT}.md`)
+  if (!existsSync(agentPath)) return
+  const content = readFileSync(agentPath, 'utf8')
+  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content)
+  if (frontmatter?.[1] === undefined) return
+  const fields = frontmatter[1].split(/\r?\n/)
+  const generatedAgent = [
+    `name: ${LEGACY_BRIDGE_AGENT}`,
+    'description: "Primary-model bridge: no built-in tools, harness tools only"',
+    'tools: []',
+    'excludeDefaultComponents: true',
+  ].every(field => fields.includes(field))
+  if (!generatedAgent) return
+  const mainAgentIndex = fields.findIndex(field => /^mainAgent:\s*/.test(field))
+  const subagentIndex = fields.findIndex(field => /^subagent:\s*/.test(field))
+  if (fields[mainAgentIndex] === 'mainAgent: false' && fields[subagentIndex] === 'subagent: false') return
+  if (mainAgentIndex >= 0) fields[mainAgentIndex] = 'mainAgent: false'
+  else fields.push('mainAgent: false')
+  if (subagentIndex >= 0) fields[subagentIndex] = 'subagent: false'
+  else fields.push('subagent: false')
+  const lineEnding = content.includes('\r\n') ? '\r\n' : '\n'
+  const newHeader = fields.join(lineEnding)
+  const updated = content.slice(0, frontmatter.index + frontmatter[0].indexOf(frontmatter[1]))
+    + newHeader
+    + content.slice(frontmatter.index + frontmatter[0].indexOf(frontmatter[1]) + frontmatter[1].length)
+  if (updated !== content) writeFileSync(agentPath, updated)
+}
+
+function prepareScopedBridgeAgent(home: string): void {
+  const pluginDir = join(home, 'config', 'plugins', BRIDGE_AGENT)
+  const agentDir = join(pluginDir, 'agents')
+  const pluginPath = join(pluginDir, 'plugin.json')
+  const agentPath = join(agentDir, `${BRIDGE_AGENT}.md`)
+  const plugin = `${JSON.stringify({ name: BRIDGE_AGENT }, null, 2)}\n`
+  const agent = [
+    '---',
+    `name: ${BRIDGE_AGENT}`,
+    'description: "DSH ACP bridge with built-in tools disabled"',
+    'tools: []',
+    'mainAgent: true',
+    'subagent: false',
+    '---',
+    '',
+  ].join('\n')
+  for (const [path, expected] of [[pluginPath, plugin], [agentPath, agent]] as const) {
+    if (existsSync(path) && readFileSync(path, 'utf8') !== expected) {
+      throw new Error(`antigravity-acp: refusing to overwrite user-owned scoped agent file at ${path}`)
+    }
+  }
+  mkdirSync(agentDir, { recursive: true })
+  writeIfChanged(pluginPath, plugin)
+  writeIfChanged(agentPath, agent)
 }
 
 /** Project id `agy` resolves for every CLI conversation that names no project. */

@@ -1,8 +1,9 @@
+// 变更追溯：CHG-20261123-221500-agy-429-cooldown-b018c2a7：上游 429 终止本次请求。
 
 // End-to-end tests of how `AntigravityRuntime.stream()` classifies a failure
 // before parking an account: a hard quota window still parks the account for
-// the reported reset, a transient 429 cools it briefly (or asks the harness
-// retry layer to try upstream again), and the gatekeeper's degraded-pool abort
+// the reported reset, an upstream 429 ends the request on the same account,
+// and the gatekeeper's degraded-pool abort
 // never parks a healthy account at all.
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -11,7 +12,8 @@ import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { AntigravityRuntime } from '../lib/runtime.js'
+import { AntigravityRuntime, mapError } from '../lib/runtime.js'
+import { LlmError } from '@deepseek-ai/dsh-llm'
 import { AntigravityAdapter } from '../lib/adapter.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -37,7 +39,7 @@ function account(id, extra = {}) {
  * fake's `RATELIMIT` directive answers with a transient 429. Other accounts
  * stay healthy.
  */
-function makeRuntime({ accounts = [], quotaAccounts = [], ratelimitAccounts = [], omitArgonAccounts = [], usageByHome = {}, degradeAction, errorMessage, errorData } = {}) {
+function makeRuntime({ accounts = [], quotaAccounts = [], ratelimitAccounts = [], omitArgonAccounts = [], usageByHome = {}, degradeAction, errorMessage, errorData, retryChunks } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'agy-failover-class-test-'))
   const armedHomes = new Set(quotaAccounts.map(entry => entry.homeDir))
   const throttledHomes = new Set(ratelimitAccounts.map(entry => entry.homeDir))
@@ -62,6 +64,8 @@ function makeRuntime({ accounts = [], quotaAccounts = [], ratelimitAccounts = []
       delete childEnv.FAKE_AGY_FAIL
       delete childEnv.FAKE_AGY_OMIT_MODELS
       childEnv.FAKE_AGY_LOG = join(env?.HOME ?? home, 'prompts.jsonl')
+      childEnv.FAKE_AGY_LIFECYCLE = join(env?.HOME ?? home, 'lifecycle.jsonl')
+      if (retryChunks && throttledHomes.has(env?.HOME)) childEnv.FAKE_AGY_RATE_RETRY = JSON.stringify(retryChunks)
       if (env?.HOME !== undefined && armedHomes.has(env.HOME)) childEnv.FAKE_AGY_FAIL = 'quota'
       if (env?.HOME !== undefined && throttledHomes.has(env.HOME)) childEnv.FAKE_AGY_FAIL = 'ratelimit'
       if (env?.HOME !== undefined && noArgonHomes.has(env.HOME)) childEnv.FAKE_AGY_OMIT_MODELS = 'gemini-4-argon'
@@ -141,7 +145,7 @@ test('a transient rate limit on the only account is rethrown with the upstream d
     messages: [sys, user('u1', 'RATELIMIT hi')],
   }))
 
-  assert.equal(error.code, 'RATE_LIMIT', 'the failure keeps the rate-limit code')
+  assert.equal(error.code, 'UPSTREAM_429', 'the failure keeps the rate-limit code')
   assert.match(error.message, /429 Too Many Requests/, 'the upstream wording reaches the caller')
   assert.doesNotMatch(error.message, /No Antigravity account/, 'a transient 429 is not a pool exhaustion')
   assert.equal(error.failure.providerRetryAfterMs, 2000, 'the stated `retry in 2s` becomes the harness retry delay')
@@ -149,31 +153,26 @@ test('a transient rate limit on the only account is rethrown with the upstream d
   assert.equal(prompts(a).length, 1, 'the account saw the step exactly once; the harness retry layer drives the retry')
 })
 
-test('a transient rate limit fails the same step over to a healthy account with a short cooldown', async () => {
+test('a transient upstream 429 stops at the first account even when another is healthy', async () => {
   const a = account('a')
   const b = account('b')
   const { runtime, adapter, prompts } = makeRuntime({ accounts: [a, b], ratelimitAccounts: [a], errorMessage: 'RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).' })
 
-  const step = await collect(adapter.stream({
+  const error = await rejectionOf(adapter.stream({
     provider: 'antigravity',
     model: 'gemini-3.8-flash',
     sessionId: 'RFC2',
     messages: [sys, user('u1', 'RATELIMIT write the weekly report')],
   }))
 
-  assert.equal(finishOf(step).reason.kind, 'stop', 'the healthy account carries the step')
-  assert.match(textOf(step), /echo:gemini-3\.8-flash:high:RATELIMIT write the weekly report/)
-  assert.equal(runtime.status().lastAccount, 'b')
-
-  const parked = runtime.status().accounts.find(row => row.id === 'a').cooldowns
-  assert.equal(parked.length, 1, 'the throttled account is cooled down, not exempt')
-  const remaining = Date.parse(parked[0].until) - Date.now()
-  assert.ok(remaining > 0, `the cooldown is still open (${remaining}ms)`)
-  assert.ok(remaining <= 60_000, `a transient cooldown stays under a minute (${remaining}ms)`)
+  assert.equal(error.code, 'UPSTREAM_429')
+  assert.equal(error.failure.status, 429)
+  assert.equal(adapter.providerRetryPolicy('antigravity').retryableCodes.includes(error.code), false)
+  assert.match(error.message, /RESOURCE_EXHAUSTED/)
+  assert.deepEqual(cooldownsOf(runtime, 'a'), [])
   assert.deepEqual(cooldownsOf(runtime, 'b'), [])
-
   assert.equal(prompts(a).length, 1)
-  assert.equal(prompts(b).length, 1)
+  assert.equal(prompts(b).length, 0)
 })
 
 test('a degraded route fails the step without cooling the account down or failing it over', async () => {
@@ -246,7 +245,7 @@ for (const message of [
   '429 quota limit exceeded for requests per minute',
   'RESOURCE_EXHAUSTED',
 ]) {
-  test('ambiguous upstream failure uses existing backoff: ' + message, async () => {
+  test('an upstream rate refusal preserves diagnostics and allows a later user request: ' + message, async () => {
     const a = account('a')
     const { runtime, adapter, prompts, warnings } = makeRuntime({
       accounts: [a], ratelimitAccounts: [a], errorMessage: message,
@@ -260,7 +259,7 @@ for (const message of [
       provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'AMBIGUOUS',
       messages: [sys, user('u1', 'RATELIMIT hi')],
     }))
-    assert.equal(error.code, 'RATE_LIMIT')
+    assert.equal(error.code, 'UPSTREAM_429')
     assert.equal(error.failure.providerRetryAfterMs, 3000)
     assert.deepEqual(cooldownsOf(runtime, 'a'), [])
     assert.equal(prompts(a).length, 1)
@@ -278,15 +277,19 @@ for (const message of [
   })
 }
 test('explicit upstream quota parks only the requested model family', async () => {
-  const a = account('a')
+  const a = account('a'), b = account('b')
   const { runtime, adapter, prompts, warnings } = makeRuntime({
-    accounts: [a], ratelimitAccounts: [a], errorMessage: '429 quota exhausted',
+    accounts: [a, b], ratelimitAccounts: [a], errorMessage: '429 quota exhausted',
     errorData: { reason: 'QUOTA_EXHAUSTED', requestId: 'quota-req', resetTime: new Date(Date.now() + 120000).toISOString() },
   })
-  await rejectionOf(adapter.stream({
+  const error = await rejectionOf(adapter.stream({
     provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'HARDQUOTA',
     messages: [sys, user('u1', 'RATELIMIT hi')],
   }))
+  assert.equal(error.code, 'QUOTA')
+  assert.equal(error.failure.status, 429)
+  assert.equal(prompts(b).length, 0)
+  assert.deepEqual(cooldownsOf(runtime, 'b'), [])
   assert.deepEqual(cooldownsOf(runtime, 'a'), ['gemini'])
   assert.equal(prompts(a).length, 1)
   assert.match(warnings.join('\n'), /quota-req/)
@@ -305,10 +308,72 @@ test('bare production error leaves the account available and provides no invente
     provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'BARE',
     messages: [sys, user('u1', 'RATELIMIT hi')],
   }))
-  assert.equal(error.code, 'RATE_LIMIT')
+  assert.equal(error.code, 'UPSTREAM_429')
   assert.equal(error.failure.providerRetryAfterMs, undefined)
   assert.deepEqual(cooldownsOf(runtime, 'a'), [])
   assert.equal(prompts(a).length, 1)
   assert.match(warnings.join('\n'), /RESOURCE_EXHAUSTED/)
   assert.doesNotMatch(warnings.join('\n'), /requestId|traceId/)
+})
+
+const retryWarning = '⚠ API error (attempt 1): upstream HTTP 429, retry in 2s, request_id="lab429"'
+for (const [name, chunks, history] of [
+  ['whole', [retryWarning], false],
+  ['split', ['⚠ API error (attempt ', '1): upstream HTTP 4', '29, retry in 2s, request_id="lab429"'], false],
+  ['split reason', ['⚠ API error (attempt 1): provider rej', 'ected the request: RESOURCE_EXH', 'AUSTED, retry in 2s, request_id="lab429"'], false],
+  ['split diagnostics', ['⚠ API error (attempt 1): HTTP 429', ', retry in 2s, request_id="lab429"\n'], false],
+  ['history ACK', [retryWarning], true],
+]) {
+  test('one upstream attempt, one cancel and no account switch for 429: ' + name, async () => {
+    const a = account('a'), b = account('b')
+    const { adapter, prompts, runtime } = makeRuntime({ accounts: [a, b], ratelimitAccounts: [a], retryChunks: chunks })
+    const messages = history
+      ? [sys, user('u0', 'old material '.repeat(22_000)), assistant('a0', [{ type: 'text', text: 'noted' }]), user('u1', 'RATELIMIT')]
+      : [sys, user('u1', 'RATELIMIT')]
+    const error = await rejectionOf(adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'cancel429', messages }))
+    assert.equal(error.code, 'UPSTREAM_429')
+    assert.equal(error.failure.status, 429)
+    assert.match(error.message, /request_id="lab429"/)
+    assert.equal(error.failure.requestId, 'lab429')
+    assert.equal(error.failure.providerRetryAfterMs, 2000)
+    assert.equal(adapter.providerRetryPolicy('antigravity').retryableCodes.includes(error.code), false)
+    const log = join(a.homeDir, 'lifecycle.jsonl')
+    let events
+    for (let n = 0; n < 120; n++) {
+      events = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line).op)
+      if (events.includes('upstream-finished')) break
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    assert.ok(events.includes('upstream-finished'))
+    assert.equal(events.filter(op => op === 'upstream-attempt').length, 1)
+    assert.equal(events.filter(op => op === 'cancel').length, 1)
+    assert.equal(prompts(a).length, 1)
+    assert.equal(prompts(b).length, 0)
+    assert.deepEqual(cooldownsOf(runtime, 'a'), [])
+  })
+}
+
+test('an SDK rate-limit error carrying HTTP 429 keeps provider details and stops host retries', () => {
+  const raw = LlmError.fromFailure({ code: 'RATE_LIMIT', status: 429, message: 'busy', providerRetryAfterMs: 19000, requestId: 'upstream-test' })
+  const mapped = mapError(raw)
+  assert.equal(mapped.code, 'UPSTREAM_429')
+  assert.equal(mapped.failure.providerRetryAfterMs, 19000)
+  assert.equal(mapped.failure.requestId, 'upstream-test')
+  assert.equal(mapError(mapped), mapped)
+})
+
+test('numeric HTTP 429 in RPC error data preserves trace and Retry-After and does not fail over', async () => {
+  const a = account('a'), b = account('b')
+  const { adapter, prompts } = makeRuntime({
+    accounts: [a, b], ratelimitAccounts: [a], errorMessage: 'provider busy',
+    errorData: { error: { code: 429 }, headers: { 'x-request-id': 'req-structured', 'Retry-After': '19' } },
+  })
+  const error = await rejectionOf(adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'structured', messages: [sys, user('u1', 'RATELIMIT')] }))
+  assert.equal(error.code, 'UPSTREAM_429')
+  assert.equal(error.failure.providerRetryAfterMs, 19_000)
+  assert.equal(error.failure.requestId, 'req-structured')
+  assert.equal(prompts(a).length, 1)
+  assert.equal(prompts(b).length, 0)
+  const lifecycle = readFileSync(join(a.homeDir, 'lifecycle.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  assert.equal(lifecycle.filter(event => event.op === 'cancel').length, 0)
 })

@@ -9,15 +9,16 @@
  * and logging through explicit ports so both session-open paths stay one code
  * path.
  * @module dsh-llm-antigravity-acp/acp-session
+ * 变更追溯：CHG-20261123-221500-agy-429-cooldown-b018c2a7
  */
 
 import { randomBytes } from 'node:crypto'
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import type { RequestMessage } from '@deepseek-ai/dsh-llm'
+import type { RequestMessage, ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { AcpConfigOption, AcpPermissionOutcome, AcpPermissionRequest, AcpProcess, AcpSessionListener } from './acp-process.ts'
 import type { Effort, EngineMode } from './config.ts'
 import type { AcpTurn } from './conversation.ts'
-import { bridgeSystemPrompt, MCP_SERVER_NAME, nativeBridgeSystemPrompt, type AcpPromptBlock, type NativeSandboxMode } from './history.ts'
+import { MCP_SERVER_NAME, nativeBridgeSystemPrompt, type AcpPromptBlock, type NativeSandboxMode } from './history.ts'
 import { labeled } from './labels.ts'
 import type { BridgeTool } from './mcp-bridge.ts'
 import type { RouteHealth } from './route-health.ts'
@@ -54,6 +55,8 @@ export interface Conversation {
   advertisedToolNames: Set<string>
   knownTools: Map<string, string>
   toolNames: Set<string>
+  /** Active DSH schemas indexed by canonical name for dispatch argument handling. */
+  activeToolSchemas: Map<string, ToolSchema>
   /** Tool calls the agent reported via `session/update` — the only trusted permission source. */
   reportedToolCalls: Map<string, ReportedToolCall>
   /** True while this conversation is being acquired or its session is opening; never evicted as idle. */
@@ -224,7 +227,7 @@ export interface McpServerEntry {
 /** What one bridge mount contributes to `session/new` or `session/load`. */
 export interface BridgeMount {
   mcpServers: McpServerEntry[]
-  systemAppend: string
+  sessionMeta: { antigravity: Record<string, unknown> }
   listener: AcpSessionListener
 }
 
@@ -251,7 +254,7 @@ export interface BridgeMountPort {
  * and a resumed session.
  * @param conv - conversation the session belongs to.
  * @param port - runtime state the mount borrows.
- * @returns the MCP endpoints, the system prompt suffix, and the session listener.
+ * @returns the MCP endpoints, session metadata, and the session listener.
  */
 export function mountBridge(conv: Conversation, port: BridgeMountPort): BridgeMount {
   const attachMcp = conv.advertisedTools.length > 0 || conv.purpose === MAIN_PURPOSE
@@ -277,10 +280,14 @@ export function mountBridge(conv: Conversation, port: BridgeMountPort): BridgeMo
     onPermission: request => port.permission(request),
   }
   const mode = port.engineMode ?? conv.engineMode ?? 'bridge'
+
   const systemAppend = mode === 'native'
     ? nativeBridgeSystemPrompt(port.system, port.toolContracts, conv.sessionCwd)
-    : bridgeSystemPrompt(port.system)
-  return { mcpServers, systemAppend, listener }
+    : ''
+  const antigravity = mode === 'bridge'
+    ? { enabledTools: [], ...(mcpServers.some(server => server.name === MCP_SERVER_NAME) ? { eagerMcpServers: [MCP_SERVER_NAME] } : {}) }
+    : { systemPrompt: { append: systemAppend } }
+  return { mcpServers, sessionMeta: { antigravity }, listener }
 }
 
 /**

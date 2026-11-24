@@ -1,6 +1,9 @@
 
 
+
 // End-to-end tests of the runtime against the scripted fake ACP agent.
+
+
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -10,14 +13,17 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import { acpClientVersion, AntigravityRuntime, compactBridgeTool, DEFAULT_RELAY_AFTER_MS, MAX_EAGER_BRIDGE_TOOL_BYTES } from '../lib/runtime.js'
+import { acpClientVersion, AntigravityRuntime, compactBridgeTool, DEFAULT_RELAY_AFTER_MS, MAX_EAGER_BRIDGE_TOOL_BYTES, MAX_TOOL_RESULT_PAGE_BYTES, pageUtf8Text, READ_TOOL_RESULT_NAME } from '../lib/runtime.js'
 import { AntigravityAdapter } from '../lib/adapter.js'
 import { Config } from '../lib/config.js'
 import { classifyAgentNotice, toTokenUsage } from '../lib/conversation.js'
-import { EMPTY_INPUT_CONTINUATION } from '../lib/history.js'
+import { BRIDGE_TEXT_BYTES, EMPTY_INPUT_CONTINUATION } from '../lib/history.js'
 import { assertSupportedAgyVersion, checkUnlock, prepareHome, resolveAgyBinary, resolvePythonArgv } from '../lib/preflight.js'
 import { AntigravityRemote, INVOCATIONS } from '../lib/remote.js'
-import { answerPermission, recordReportedToolCall } from '../lib/tool-bridge.js'
+import {
+  answerPermission, isBridgeServerName, recordReportedToolCall, sanitizeMcpToolArguments,
+  stripAgentToolPrefix, validateRequiredToolArguments,
+} from '../lib/tool-bridge.js'
 import {
   decodeGenMetadata, decodeStepMetadata,
   evaluateDegradeFingerprint, sessionDbPath,
@@ -33,6 +39,8 @@ function makeRuntime(extra = {}) {
   const log = join(home, 'prompts.jsonl')
   const initLog = join(home, 'init.jsonl')
   const mcpLog = join(home, 'mcp.jsonl')
+  const mcpResultLog = join(home, 'mcp-results.jsonl')
+  const lifecycleLog = join(home, 'lifecycle.jsonl')
   const config = {
     provider: 'antigravity', displayName: 'Antigravity', command: fake, home,
     // The machine account is an ordinary list entry that reuses this Mac's login.
@@ -44,7 +52,7 @@ function makeRuntime(extra = {}) {
   const runtime = new AntigravityRuntime({
     config,
     spawnAcp: (argv, cwd) => {
-      const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], { cwd, env: { ...process.env, FAKE_AGY_LOG: log, FAKE_AGY_INIT: initLog, FAKE_AGY_MCP: mcpLog, ...extra.env }, stdio: ['pipe', 'pipe', 'pipe'] })
+      const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], { cwd, env: { ...process.env, FAKE_AGY_LOG: log, FAKE_AGY_INIT: initLog, FAKE_AGY_MCP: mcpLog, FAKE_AGY_MCP_RESULT_LOG: mcpResultLog, FAKE_AGY_LIFECYCLE: lifecycleLog, ...extra.env }, stdio: ['pipe', 'pipe', 'pipe'] })
       let stderr = ''
       child.stderr.on('data', d => { stderr += d })
       return {
@@ -66,7 +74,9 @@ function makeRuntime(extra = {}) {
   const prompts = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
   const inits = () => existsSync(initLog) ? readFileSync(initLog, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
   const mcps = () => existsSync(mcpLog) ? readFileSync(mcpLog, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
-  return { home, runtime, prompts, inits, mcps, adapter: new AntigravityAdapter(runtime, 'Antigravity', () => true) }
+  const mcpResults = () => existsSync(mcpResultLog) ? readFileSync(mcpResultLog, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
+  const lifecycle = () => existsSync(lifecycleLog) ? readFileSync(lifecycleLog, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
+  return { home, runtime, prompts, inits, mcps, mcpResults, lifecycle, adapter: new AntigravityAdapter(runtime, 'Antigravity', () => true) }
 }
 
 after(async () => { for (const r of runtimes) await r.dispose() })
@@ -76,7 +86,11 @@ const user = (id, text) => ({ id, role: 'user', content: [{ type: 'text', text }
 const assistant = (id, content) => ({ id, role: 'assistant', content, source: { kind: 'model', provider: 'antigravity', model: 'gemini-4-argon' } })
 const tool = (id, callId, text, isError) => ({ id, role: 'tool', toolCallId: callId, content: [{ type: 'text', text }], source: { kind: 'tool', callId }, ...isError ? { isError: true } : {} })
 const bash = { name: 'bash', description: 'Run a command', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }
+const lookup = { name: 'lookup', description: 'Look up one entry', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } }
+const dshCustom = { name: 'dsh_custom', description: 'Run a custom DSH tool', parameters: { type: 'object', properties: { token: { type: 'string' }, toolSummary: { type: 'string' } }, required: ['token'] } }
 const read = { name: 'read_file', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }
+const jobOutput = { name: 'job_output', description: 'Read output from a completed job.', parameters: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'] } }
+const pageText = result => result.content.map(block => block.text ?? '').join('').match(/---BEGIN_PAGE_TEXT---\n([\s\S]*?)\n---END_PAGE_TEXT---/u)?.[1]
 
 async function collect(iterable) {
   const chunks = []
@@ -90,15 +104,16 @@ const callsOf = chunks => chunks.filter(c => c.type === 'block-end' && c.block.t
 const assistantFrom = (id, chunks) => assistant(id, chunks.filter(c => c.type === 'block-end').map(c => c.block))
 
 test('single turn streams reasoning, text, exact usage, and the selected model and effort', async () => {
-  const { adapter, prompts } = makeRuntime()
+  const { adapter, prompts, lifecycle } = makeRuntime()
   const chunks = await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash', reasoningEffort: 'low', sessionId: 'S1', messages: [sys, user('u1', 'hello')] }))
   assert.equal(finishOf(chunks).reason.kind, 'stop')
   assert.ok(chunks.some(c => c.type === 'reasoning-delta' && c.text === 'thinking(low)'))
   assert.match(textOf(chunks), /^echo:gemini-3\.8-flash:low:/)
   const usage = chunks.find(c => c.type === 'usage').usage
   assert.deepEqual(usage, { inputTokens: 600, outputTokens: 50, cacheReadTokens: 400, reasoningTokens: 20, totalTokens: 1050 })
-  assert.match(prompts()[0].system.replaceAll('\u200b', ''), /primary model of this coding session/)
-  assert.doesNotMatch(prompts()[0].system, /DeepSeek Harness/)
+  assert.equal(prompts()[0].system, '', 'bridge rules stay out of ACP systemPrompt metadata')
+  assert.match(prompts()[0].text, /<dsh_system_instruction>[\s\S]*You are DSH\./)
+  assert.deepEqual(lifecycle().find(event => event.op === 'new').meta.antigravity, { enabledTools: [], eagerMcpServers: ['dsh'] })
 })
 
 test('resolveModel declares the context window, three efforts, and in-history system updates', async () => {
@@ -121,7 +136,7 @@ test('a tool call parks, ends the step, and resumes the same ACP turn with the D
   const [call] = callsOf(step1)
   assert.equal(call.name, 'bash')
   assert.deepEqual(JSON.parse(call.arguments), { command: 'ls' })
-  assert.deepEqual(prompts()[0].tools, ['bash', 'dsh_await_result', 'dsh_call_tool'])
+  assert.deepEqual(prompts()[0].tools, ['bash', 'dsh_await_result', 'dsh_call_tool', 'dsh_read_tool_result'])
   const history = [sys, user('u1', 'CALL bash {"command":"ls"}'), assistantFrom('a1', step1), tool('t1', call.id, 'file-a')]
   const step2 = await collect(adapter.stream({ ...base, messages: history }))
   assert.equal(finishOf(step2).reason.kind, 'stop')
@@ -136,6 +151,168 @@ test('a tool call parks, ends the step, and resumes the same ACP turn with the D
   const third = prompts()[1]
   assert.equal(third.text, 'second question')
   assert.equal(third.session, prompts()[0].session)
+})
+
+test('bridge pages recover a long cursor job result without rerunning it and retain original text-part indexes', async () => {
+  const original = Array.from({ length: 520 }, (_, i) => `${i.toString().padStart(3, '0')}: ${'"\\'.repeat(12)}技能行${i} — ${'界'.repeat(5)}\n`).join('')
+  assert.ok(Buffer.byteLength(original, 'utf8') > 19_000)
+  const pageLimit = 2_500
+  const expectedOffsets = []
+  for (let offset = 0; ; ) {
+    expectedOffsets.push(offset)
+    const page = pageUtf8Text(original, offset, pageLimit)
+    assert.ok(page.ok)
+    if (page.page.nextOffset === undefined) break
+    offset = page.page.nextOffset
+  }
+  let afterTool = { text: 'Recovered every result page.' }
+  for (let page = expectedOffsets.length - 1; page >= 0; page--) {
+    afterTool = {
+      tool: { name: READ_TOOL_RESULT_NAME, args: { result_id: '$previous_tool_result', part: 1, offset: page === 0 ? 0 : '$previous_page_next_offset', limit: pageLimit } },
+      afterTool,
+    }
+  }
+  const plan = [{ tool: { name: 'job_output', args: { job_id: 'job-7' } }, afterTool }]
+  const { adapter, prompts, mcpResults } = makeRuntime({ config: { engineMode: 'bridge' }, env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-result-pages', tools: [jobOutput] }
+  const step1 = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'Read the job output.')] }))
+  const [call] = callsOf(step1)
+  assert.equal(call.name, 'job_output')
+  const image = { type: 'image', attachment: { attachmentId: 'skill-image', mimeType: 'image/png' } }
+  const originalResult = { id: 't1', role: 'tool', toolCallId: call.id, content: [{ type: 'text', text: 'job output header\n' }, image, { type: 'text', text: original }], source: { kind: 'tool', callId: call.id } }
+  const step2 = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'Read the job output.'), assistantFrom('a1', step1), originalResult] }))
+
+  assert.equal(finishOf(step2).reason.kind, 'stop')
+  assert.deepEqual(callsOf(step2), [], 'page reads stay inside the MCP route and do not create DSH tool calls')
+  assert.equal(prompts().length, 1, 'all pages are read inside the original ACP prompt')
+  assert.ok(prompts()[0].tools.includes(READ_TOOL_RESULT_NAME), 'the bridge session advertises the read-only helper')
+  const records = mcpResults()
+  const sourceCalls = records.filter(result => result.name === 'job_output')
+  assert.equal(sourceCalls.length, 1, 'the cursor job output source ran exactly once')
+  assert.deepEqual(sourceCalls[0].arguments, { job_id: 'job-7' }, 'the source job is not rerun for any page')
+  assert.ok(sourceCalls[0].content.some(block => block.type === 'image'), 'the original image remains in the initial MCP result')
+  const pages = records.filter(result => result.name === READ_TOOL_RESULT_NAME)
+  assert.equal(pages.length, expectedOffsets.length)
+  assert.ok(pages.every(result => !result.isError && result.content[0].text.includes('source_is_error: false')))
+  assert.ok(pages.every(result => Buffer.byteLength(JSON.stringify({ content: result.content }), 'utf8') <= 9_600), 'each page respects the serialized MCP result budget')
+  assert.ok(pages.every(result => result.arguments.part === 1), 'the image did not shift the second original text part index')
+  const ranges = pages.map(page => /byte_range: \[(\d+), (\d+)\)/u.exec(page.text))
+  for (let index = 1; index < pages.length; index++) assert.equal(pages[index].arguments.offset, Number(ranges[index - 1]?.[2]))
+  assert.equal(pages.map(pageText).join(''), original, 'concatenated UTF-8 pages reproduce the exact original text')
+})
+
+test('result pages use the newest same-call-id text and report source errors without failing the page read', async () => {
+  const originalText = `old-version ${'o'.repeat(15_000)}`
+  const correctedText = `corrected-current-version ${'n'.repeat(15_000)}`
+  const errorText = `source-error ${'e'.repeat(12_000)}`
+  const plan = [
+    { tool: { name: 'job_output', args: { job_id: 'job-error' } }, afterTool: { text: 'source call completed' } },
+    { tool: { name: READ_TOOL_RESULT_NAME, args: { result_id: '$previous_session_tool_result', part: 0, offset: 0, limit: 7_000 } }, text: 'read latest history' },
+    { tool: { name: READ_TOOL_RESULT_NAME, args: { result_id: '$previous_session_tool_result', part: 0, offset: 0, limit: 7_000 } }, text: 'read failed output' },
+  ]
+  const { adapter, mcpResults } = makeRuntime({ config: { engineMode: 'bridge' }, env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-result-current', tools: [jobOutput] }
+  const firstUser = user('u1', 'Collect output.')
+  const step1 = await collect(adapter.stream({ ...base, messages: [sys, firstUser] }))
+  const [call] = callsOf(step1)
+  const firstResult = tool('t1', call.id, originalText)
+  await collect(adapter.stream({ ...base, messages: [sys, firstUser, assistantFrom('a1', step1), firstResult] }))
+
+  const corrected = tool('t1-corrected', call.id, correctedText)
+  const secondUser = user('u2', 'Read the current result.')
+  await collect(adapter.stream({ ...base, messages: [sys, firstUser, assistantFrom('a1', step1), firstResult, corrected, assistant('a2', [{ type: 'text', text: 'collected' }]), secondUser] }))
+  const latestPage = mcpResults().filter(result => result.name === READ_TOOL_RESULT_NAME).at(-1)
+  assert.ok(latestPage)
+  assert.ok(latestPage.content[0].text.includes('corrected-current-version'))
+  assert.ok(!latestPage.content[0].text.includes('old-version'), 'current DSH history wins over any earlier result with the same call id')
+
+  const thirdUser = user('u3', 'Read the error output.')
+  await collect(adapter.stream({ ...base, messages: [sys, firstUser, assistantFrom('a1', step1), tool('t1-corrected', call.id, errorText, true), assistant('a2', [{ type: 'text', text: 'collected' }]), secondUser, assistant('a3', [{ type: 'text', text: 'read current result' }]), thirdUser] }))
+  const results = mcpResults().filter(result => result.name === READ_TOOL_RESULT_NAME)
+  const errorPage = results.at(-1)
+  assert.equal(mcpResults().filter(result => result.name === 'job_output')[0].isError, false)
+  assert.ok(errorPage)
+  assert.equal(errorPage.isError, false, 'paging a failed source succeeds as an MCP read')
+  assert.ok(errorPage.content[0].text.includes('source_is_error: true'))
+})
+
+test('an error source remains an error while its lossless page read succeeds', async () => {
+  const errorText = `job failed with retained diagnostic text: ${'"\\'.repeat(5_000)}`
+  const plan = [{
+    tool: { name: 'job_output', args: { job_id: 'job-failed' } },
+    afterTool: {
+      tool: { name: READ_TOOL_RESULT_NAME, args: { result_id: '$previous_tool_result', part: 0, offset: 0, limit: MAX_TOOL_RESULT_PAGE_BYTES } },
+      afterTool: { text: 'error output recovered' },
+    },
+  }]
+  const { adapter, mcpResults } = makeRuntime({ config: { engineMode: 'bridge' }, env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-result-error', tools: [jobOutput] }
+  const input = user('u1', 'Read the failed job output.')
+  const step1 = await collect(adapter.stream({ ...base, messages: [sys, input] }))
+  const [call] = callsOf(step1)
+  assert.ok(call)
+  const step2 = await collect(adapter.stream({ ...base, messages: [sys, input, assistantFrom('a1', step1), tool('t1', call.id, errorText, true)] }))
+  assert.equal(finishOf(step2).reason.kind, 'stop')
+  const records = mcpResults()
+  const source = records.find(result => result.name === 'job_output')
+  const page = records.find(result => result.name === READ_TOOL_RESULT_NAME)
+  assert.ok(source)
+  assert.equal(source.isError, true, 'the originating MCP tool result keeps its error flag')
+  assert.ok(page)
+  assert.equal(page.isError, false, 'rereading a page is a successful operation')
+  assert.ok(page.content[0].text.includes('source_is_error: true'))
+  assert.ok(page.content[0].text.includes(errorText.slice(0, 80)))
+  assert.ok(Buffer.byteLength(JSON.stringify({ content: page.content }), 'utf8') <= 9_600)
+  assert.ok(Number(/page_bytes: (\d+)/u.exec(page.content[0].text)?.[1]) < MAX_TOOL_RESULT_PAGE_BYTES, 'quote-heavy content shrinks to fit its serialized byte budget')
+})
+
+test('unknown and cross-conversation result ids return the same non-disclosing error', async () => {
+  const longText = `foreign-session ${'x'.repeat(12_000)}`
+  const plan = [
+    { tool: { name: 'job_output', args: { job_id: 'private-job' } }, afterTool: { text: 'source complete' } },
+    { tool: { name: READ_TOOL_RESULT_NAME, args: { result_id: '$previous_session_tool_result', part: 0, offset: 0, limit: 256 } }, text: 'cross-session check' },
+    { tool: { name: READ_TOOL_RESULT_NAME, args: { result_id: 'missing-result-id', part: 0, offset: 0, limit: 256 } }, text: 'unknown id check' },
+  ]
+  const { adapter, mcpResults } = makeRuntime({ config: { engineMode: 'bridge' }, env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const sourceBase = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-result-source', tools: [jobOutput] }
+  const sourceUser = user('u1', 'Start a private job.')
+  const sourceStep = await collect(adapter.stream({ ...sourceBase, messages: [sys, sourceUser] }))
+  const [sourceCall] = callsOf(sourceStep)
+  await collect(adapter.stream({ ...sourceBase, messages: [sys, sourceUser, assistantFrom('a1', sourceStep), tool('t1', sourceCall.id, longText)] }))
+
+  const otherBase = { ...sourceBase, sessionId: 'S-result-other' }
+  const otherUser = user('u2', 'Attempt to read another conversation result.')
+  await collect(adapter.stream({ ...otherBase, messages: [sys, otherUser] }))
+  const crossSession = mcpResults().filter(result => result.name === READ_TOOL_RESULT_NAME).at(-1)
+  assert.ok(crossSession)
+  assert.equal(crossSession.isError, true)
+  assert.equal(crossSession.content[0].text, 'Unknown tool result id.')
+  assert.notEqual(crossSession.session, mcpResults().find(result => result.name === 'job_output').session)
+
+  const unknownUser = user('u3', 'Try a nonexistent result id.')
+  await collect(adapter.stream({ ...otherBase, messages: [sys, otherUser, assistant('a2', [{ type: 'text', text: 'denied' }]), unknownUser] }))
+  const unknown = mcpResults().filter(result => result.name === READ_TOOL_RESULT_NAME).at(-1)
+  assert.ok(unknown)
+  assert.equal(unknown.isError, true)
+  assert.equal(unknown.content[0].text, 'Unknown tool result id.')
+})
+
+test('a truncated read keeps its XML content block closed before the separate recovery notice', async () => {
+  const plan = [{ tool: { name: 'read', args: { file_path: '/w/skill/SKILL.md' } }, afterTool: { text: 'read returned' } }]
+  const readTool = { name: 'read', description: 'Read a file.', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+  const { adapter, mcpResults } = makeRuntime({ config: { engineMode: 'bridge' }, env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-result-read', tools: [readTool] }
+  const input = user('u1', 'Read the skill.')
+  const step1 = await collect(adapter.stream({ ...base, messages: [sys, input] }))
+  const [call] = callsOf(step1)
+  const body = Array.from({ length: 2_000 }, (_, i) => `${i + 1}: ${'skill content '.repeat(5)}`).join('\n')
+  const readResult = `<path>/w/skill/SKILL.md</path>\n<type>file</type>\n<content>\n${body}\n\n(End of file - total 2000 lines)\n</content>`
+  await collect(adapter.stream({ ...base, messages: [sys, input, assistantFrom('a1', step1), tool('t1', call.id, readResult)] }))
+  const delivered = mcpResults().find(result => result.name === 'read')
+  assert.ok(delivered)
+  assert.ok(delivered.content[0].text.endsWith('</content>'))
+  assert.ok(delivered.content[1].text.startsWith('\n\n[The tool result text was truncated'))
+  assert.ok(delivered.content[1].text.includes('tool_result_page:'))
 })
 
 test('parallel tool calls arrive as one DSH step', async () => {
@@ -490,10 +667,39 @@ test('bridge replay preserves the oldest history, closes the block, and keeps th
   const replay = prompts().at(-1)
   assert.notEqual(replay.session, prompts()[0].session)
   assert.match(replay.text, /^<dsh_history>\n/)
-  assert.match(replay.text, /\n<\/dsh_history>\n\nLATEST /)
+  assert.match(replay.text, /\n<\/dsh_history>\n\n<dsh_system_instruction>/)
+  assert.match(replay.text, /<\/dsh_system_instruction>\n\nLATEST /)
   assert.ok(replay.text.endsWith(latest))
   for (const original of [old1, old2, old3, old4]) assert.ok(replay.text.includes(original))
   assert.doesNotMatch(replay.text, /history messages omitted/)
+})
+
+test('bridge hands off rules only when they push a near-limit initial request over the live ACP budget', async () => {
+  const { adapter, prompts } = makeRuntime()
+  const nearLimit = 'Q'.repeat(BRIDGE_TEXT_BYTES - 64)
+  await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-near-limit', messages: [sys, user('u1', nearLimit)] }))
+  const turns = prompts()
+  assert.equal(turns.length, 2, 'one rule ACK handoff precedes the single live answer')
+  assert.match(turns[0].text, /Initial DSH system instructions[\s\S]*<dsh_system_instruction>/)
+  assert.doesNotMatch(turns[0].text, /Q{100}/, 'the live user content is not mixed into the rules handoff')
+  assert.equal(turns[1].text, nearLimit, 'the complete user request stays intact in the answering prompt')
+  assert.equal(Buffer.byteLength(turns[1].text, 'utf8'), BRIDGE_TEXT_BYTES - 64)
+  assert.doesNotMatch(turns[1].text, /dsh_system_instruction/, 'the separately acknowledged rules are not repeated')
+})
+
+test('large bridge rules are ACKed in ordered chunks and stay out of the fake live answer', async () => {
+  const { adapter, prompts } = makeRuntime()
+  const rules = 'RULE_SECTION/'.repeat(Math.ceil((BRIDGE_TEXT_BYTES * 2) / 'RULE_SECTION/'.length))
+  const largeSystem = { ...sys, content: [{ type: 'text', text: rules }] }
+  const live = 'LIVE_RULE_SPLIT_REQUEST'
+  const chunks = await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'large-rules', messages: [largeSystem, user('u1', live)] }))
+  const turns = prompts()
+  assert.ok(turns.length >= 3, 'a rules block larger than two ACP budgets uses multiple existing ACK handoffs')
+  assert.ok(turns.slice(0, -1).every(turn => /^(?:Initial DSH system instructions|Continue reading the initial DSH system instructions)/.test(turn.text)))
+  assert.ok(turns.slice(0, -1).every(turn => Buffer.byteLength(turn.text, 'utf8') <= BRIDGE_TEXT_BYTES))
+  assert.ok(turns.slice(0, -1).map(turn => turn.text).join('').includes('RULE_SECTION/'))
+  assert.equal(turns.at(-1).text, live)
+  assert.match(textOf(chunks), /^echo:gemini-4-argon:high:LIVE_RULE_SPLIT_REQUEST$/)
 })
 
 test('live configure updates context window, default effort, and long-decode continuations immediately', async () => {
@@ -758,6 +964,89 @@ test('permission gate accepts agy 1.5.8 name-only MCP calls while rejecting unof
   }
 })
 
+
+test('bridge tool aliases normalize both direct and dynamic calls with schema-aware arguments', async () => {
+  const plan = [
+    { tool: { name: 'mcp_dsh_lookup', args: { query: 'legacy', toolSummary: 'synthetic' } } },
+    { tool: { name: 'dsh_call_tool', args: { name: 'mcp_dsh_1234abcd_dsh_custom', arguments: { token: 'scoped', toolSummary: 'declared' } } } },
+  ]
+  const { adapter } = makeRuntime({ config: { engineMode: 'bridge' }, env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-tool-aliases', tools: [lookup, dshCustom] }
+  const firstUser = user('u1', 'Use the legacy direct alias.')
+  const first = await collect(adapter.stream({ ...base, messages: [sys, firstUser] }))
+  assert.equal(finishOf(first).reason.kind, 'tool-calls')
+  const [direct] = callsOf(first)
+  assert.equal(direct.name, 'lookup')
+  assert.deepEqual(JSON.parse(direct.arguments), { query: 'legacy' }, 'undeclared toolSummary is dropped before DSH executes the tool')
+
+  const firstHistory = [sys, firstUser, assistantFrom('a1', first), tool('t1', direct.id, 'lookup result')]
+  const resumed = await collect(adapter.stream({ ...base, messages: firstHistory }))
+  const secondUser = user('u2', 'Use the scoped dynamic alias.')
+  const second = await collect(adapter.stream({ ...base, messages: [...firstHistory, assistantFrom('a2', resumed), secondUser] }))
+  assert.equal(finishOf(second).reason.kind, 'tool-calls')
+  const [dynamic] = callsOf(second)
+  assert.equal(dynamic.name, 'dsh_custom')
+  assert.deepEqual(JSON.parse(dynamic.arguments), { token: 'scoped', toolSummary: 'declared' }, 'schema-declared toolSummary is preserved')
+})
+
+test('bridge alias failures show required signatures and reject foreign tool names', async () => {
+  const plan = [
+    { tool: { name: 'mcp_dsh_lookup', args: { toolSummary: 'synthetic' } } },
+    { tool: { name: 'dsh_call_tool', args: { name: 'mcp_dsh_1234abcd_dsh_custom', arguments: {} } } },
+    { tool: { name: 'dsh_call_tool', args: { name: 'mcp_other_lookup', arguments: { query: 'foreign' } } } },
+  ]
+  const { adapter } = makeRuntime({ config: { engineMode: 'bridge' }, env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-tool-validation', tools: [lookup, dshCustom] }
+  const first = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'Call lookup without its query.')] }))
+  assert.equal(finishOf(first).reason.kind, 'stop')
+  assert.deepEqual(callsOf(first), [])
+  assert.match(textOf(first), /Expected signature: lookup\(query: string\)/)
+
+  const second = await collect(adapter.stream({ ...base, messages: [sys, user('u2', 'Call the custom tool without its token.')] }))
+  assert.equal(finishOf(second).reason.kind, 'stop')
+  assert.deepEqual(callsOf(second), [])
+  assert.match(textOf(second), /Expected signature: dsh_custom\(token: string, toolSummary\?: string\)/)
+
+  const foreign = await collect(adapter.stream({ ...base, messages: [sys, user('u3', 'Try an unregistered foreign tool.')] }))
+  assert.equal(finishOf(foreign).reason.kind, 'stop')
+  assert.deepEqual(callsOf(foreign), [])
+  assert.match(textOf(foreign), /The harness has no tool named mcp_other_lookup/)
+})
+
+test('tool compatibility preserves MCP scope identity and only removes undeclared summaries', () => {
+  assert.equal(isBridgeServerName('dsh'), true)
+  assert.equal(isBridgeServerName('dsh_1234ABCD'), true)
+  assert.equal(isBridgeServerName('foreign_1234abcd'), false)
+  assert.equal(stripAgentToolPrefix('mcp_dsh_lookup'), 'lookup')
+  assert.equal(stripAgentToolPrefix('mcp_dsh_1234abcd_dsh_custom'), 'dsh_custom')
+  assert.equal(stripAgentToolPrefix('dsh_1234abcd_lookup'), 'lookup')
+  assert.equal(stripAgentToolPrefix('dsh_read_tool_result'), 'dsh_read_tool_result')
+  assert.deepEqual(sanitizeMcpToolArguments({ query: 'ok', toolSummary: 'extra' }, lookup), { query: 'ok' })
+  assert.deepEqual(sanitizeMcpToolArguments({ token: 'ok', toolSummary: 'declared' }, dshCustom), { token: 'ok', toolSummary: 'declared' })
+  assert.equal(validateRequiredToolArguments(lookup, {}), 'Invalid arguments for tool lookup: missing required parameter(s): query. Expected signature: lookup(query: string)')
+
+  const reported = new Map()
+  const options = [{ optionId: 'allow', kind: 'allow_once' }, { optionId: 'deny', kind: 'reject_once' }]
+  const state = {
+    sessionId: 'scope-session', tenantKey: 'tenant', turnLive: true, engineMode: 'bridge',
+    reportedToolCalls: reported, advertisedToolNames: new Set(['bash']),
+  }
+  assert.equal(recordReportedToolCall({ reportedToolCalls: reported }, {
+    sessionUpdate: 'tool_call', toolCallId: 'scoped-call', name: 'mcp_dsh_1234abcd_bash',
+    mcpServerName: 'dsh_1234abcd', mcpToolName: 'bash', kind: 'other',
+  }), 'created')
+  assert.deepEqual(answerPermission(state, {
+    sessionId: 'scope-session',
+    toolCall: { toolCallId: 'scoped-call', name: 'mcp_dsh_1234abcd_bash', mcpServerName: 'dsh_1234abcd', mcpToolName: 'bash', kind: 'other' },
+    options,
+  }, { hasHandshake: () => true, warn() {} }), { outcome: 'selected', optionId: 'allow' })
+  assert.deepEqual(answerPermission(state, {
+    sessionId: 'scope-session',
+    toolCall: { toolCallId: 'scoped-call', name: 'mcp_dsh_deadbeef_bash', mcpServerName: 'dsh_deadbeef', mcpToolName: 'bash', kind: 'other' },
+    options,
+  }, { hasHandshake: () => true, warn() {} }), { outcome: 'selected', optionId: 'deny' })
+})
+
 test('the permission gate binds the loading probe to a handshake and keeps identities across updates', async () => {
   const { adapter } = makeRuntime()
   const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S31', tools: [bash, read] }
@@ -962,7 +1251,7 @@ test('dynamic tool additions, removals, and same-turn unlocks keep the ACP sessi
   assert.equal(finishOf(s1).reason.kind, 'tool-calls')
   const [c1] = callsOf(s1)
   assert.equal(c1.name, 'tool_list')
-  assert.deepEqual(prompts()[0].tools, ['tool_list', 'dsh_await_result', 'dsh_call_tool'])
+  assert.deepEqual(prompts()[0].tools, ['tool_list', 'dsh_await_result', 'dsh_call_tool', 'dsh_read_tool_result'])
 
   let hist = [sys, user('u1', turn1Prompt), assistantFrom('a1', s1), tool('t1', c1.id, 'opened ui')]
   const s2 = await collect(adapter.stream({ ...session, tools: [toolList, preview], messages: hist }))
@@ -985,7 +1274,7 @@ test('dynamic tool additions, removals, and same-turn unlocks keep the ACP sessi
   assert.equal(prompts()[1].session, prompts()[0].session)
   assert.doesNotMatch(prompts()[1].text, /<dsh_history>/)
   assert.match(prompts()[1].text, /^<harness_tool_update>\n\[tool available via mcp_dsh_dsh_call_tool with \{"name":"read_file"/)
-  assert.deepEqual(prompts()[1].tools, ['tool_list', 'dsh_await_result', 'dsh_call_tool'], 'advertised MCP tool prefix stays frozen')
+  assert.deepEqual(prompts()[1].tools, ['tool_list', 'dsh_await_result', 'dsh_call_tool', 'dsh_read_tool_result'], 'advertised MCP tool prefix stays frozen')
   const [c3] = callsOf(s4)
   assert.equal(c3.name, 'read_file')
   hist = [...hist, assistantFrom('a4', s4), tool('t3', c3.id, 'readme-body')]
@@ -1017,7 +1306,7 @@ test('dynamic tool additions, removals, and same-turn unlocks keep the ACP sessi
   // Scenario E: a main session opened with no initial tools still mounts the MCP bridge for later dynamic tools.
   const emptyInit = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S18-empty' }
   const e1 = await collect(adapter.stream({ ...emptyInit, tools: [], messages: [sys, user('eu1', 'hello')] }))
-  assert.deepEqual(prompts().at(-1).tools, ['dsh_await_result', 'dsh_call_tool'])
+  assert.deepEqual(prompts().at(-1).tools, ['dsh_await_result', 'dsh_call_tool', 'dsh_read_tool_result'])
   const eHist = [sys, user('eu1', 'hello'), assistantFrom('ea1', e1), user('eu2', 'CALL dsh_call_tool {"name":"bash","arguments":{"command":"echo hi"}}')]
   const e2 = await collect(adapter.stream({ ...emptyInit, tools: [bash], messages: eHist }))
   assert.equal(finishOf(e2).reason.kind, 'tool-calls')
@@ -1382,6 +1671,9 @@ test('session-index.json resumes ACP sessions via native session/load across cap
 
   const a1 = await collect(first.adapter.stream({ ...baseA, messages: [sys, user('au1', 'turn one')] }))
   const sessionA = first.prompts()[0].session
+  assert.match(first.prompts()[0].text, /<dsh_system_instruction>/)
+  const bridgeOpen = first.lifecycle().find(event => event.op === 'new')
+  assert.deepEqual(bridgeOpen.meta.antigravity, { enabledTools: [], eagerMcpServers: ['dsh'] })
   let histA = [sys, user('au1', 'turn one'), assistantFrom('aa1', a1)]
 
   // Opening S-persist-B under maxLiveSessions=1 evicts S-persist-A from memory while persisting it.
@@ -1392,13 +1684,16 @@ test('session-index.json resumes ACP sessions via native session/load across cap
   const a2 = await collect(first.adapter.stream({ ...baseA, messages: histA }))
   assert.equal(first.prompts().at(-1).session, sessionA, 'evicted session resumes original ACP sessionId via session/load')
   assert.doesNotMatch(first.prompts().at(-1).text, /<dsh_history>/)
+  assert.doesNotMatch(first.prompts().at(-1).text, /dsh_system_instruction/, 'session/load does not resend the initial rules')
   assert.ok(first.mcps().some(m => m.op === 'load' && m.session === sessionA))
+  assert.deepEqual(first.lifecycle().find(event => event.op === 'load').meta.antigravity, { enabledTools: [], eagerMcpServers: ['dsh'] })
   histA = [...histA, assistantFrom('aa2', a2)]
 
   // Full provider restart on the same `home` directory also resumes `sessionA` via `session/load`!
   await first.runtime.dispose()
   const log2 = join(first.home, 'prompts2.jsonl')
   const mcp2 = join(first.home, 'mcp2.jsonl')
+  const lifecycle2 = join(first.home, 'lifecycle2.jsonl')
   const restarted = new AntigravityRuntime({
     config: {
       provider: 'antigravity', displayName: 'Antigravity', command: fake, home: first.home,
@@ -1408,7 +1703,7 @@ test('session-index.json resumes ACP sessions via native session/load across cap
       longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000,
     },
     spawnAcp: (argv, cwd) => {
-      const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], { cwd, env: { ...process.env, FAKE_AGY_LOG: log2, FAKE_AGY_MCP: mcp2 }, stdio: ['pipe', 'pipe', 'pipe'] })
+      const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], { cwd, env: { ...process.env, FAKE_AGY_LOG: log2, FAKE_AGY_MCP: mcp2, FAKE_AGY_LIFECYCLE: lifecycle2 }, stdio: ['pipe', 'pipe', 'pipe'] })
       return {
         stdin: child.stdin,
         stdout: child.stdout,
@@ -1429,9 +1724,23 @@ test('session-index.json resumes ACP sessions via native session/load across cap
   await collect(adapter2.stream({ ...baseA, messages: histA }))
   const prompts2 = readFileSync(log2, 'utf8').trim().split('\n').map(l => JSON.parse(l))
   const mcps2 = readFileSync(mcp2, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  const wire2 = readFileSync(lifecycle2, 'utf8').trim().split('\n').map(l => JSON.parse(l))
   assert.equal(prompts2[0].session, sessionA, 'restarted runtime resumes original ACP sessionId via session/load')
   assert.doesNotMatch(prompts2[0].text, /<dsh_history>/)
+  assert.doesNotMatch(prompts2[0].text, /dsh_system_instruction/, 'a restored session retains its original rules without resending them')
   assert.ok(mcps2.some(m => m.op === 'load' && m.session === sessionA))
+  assert.deepEqual(wire2.find(event => event.op === 'load').meta.antigravity, { enabledTools: [], eagerMcpServers: ['dsh'] })
+
+  const changedSys = { ...sys, id: 'sys-changed', content: [{ type: 'text', text: 'NEW_HOST_RULE: use the current DSH policy.' }] }
+  const changedHist = [changedSys, ...histA.slice(1), user('au-new-rule', 'continue under changed rules')]
+  await collect(adapter2.stream({ ...baseA, messages: changedHist }))
+  const changedPrompt = readFileSync(log2, 'utf8').trim().split('\n').map(l => JSON.parse(l)).at(-1)
+  assert.notEqual(changedPrompt.session, sessionA, 'changed DSH system rules invalidate the persisted ACP session')
+  assert.equal((changedPrompt.text.match(/<dsh_system_instruction>/g) ?? []).length, 1)
+  assert.match(changedPrompt.text, /NEW_HOST_RULE/)
+  const lifecycleAfterChange = readFileSync(lifecycle2, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+  assert.equal(lifecycleAfterChange.filter(event => event.op === 'load').length, 1, 'changed rules do not load the prior session again')
+  assert.deepEqual(lifecycleAfterChange.filter(event => event.op === 'new').at(-1).meta.antigravity, { enabledTools: [], eagerMcpServers: ['dsh'] })
 
   // Compaction (pruned message prefix) invalidates the persisted session and rebuilds cleanly.
   const compactedHist = [
@@ -1446,7 +1755,7 @@ test('session-index.json resumes ACP sessions via native session/load across cap
   assert.match(promptsAfterCompact.at(-1).text, /<dsh_history>/)
 })
 
-test('prompt hierarchy lifts AGENTS.md into <user_rules>, preserves oversized tool contracts, orders human input last, and supports toolUpdate in-history', async () => {
+test('prompt hierarchy carries initial DSH rules once, orders human input last, and supports toolUpdate in-history', async () => {
   const { adapter, prompts } = makeRuntime()
   const resolved = await adapter.resolveModel('antigravity', 'gemini-4-argon')
   assert.equal(resolved.toolUpdate, 'in-history')
@@ -1477,7 +1786,7 @@ test('prompt hierarchy lifts AGENTS.md into <user_rules>, preserves oversized to
   const skillCatalog = {
     id: 'skills-1',
     role: 'user',
-    source: { kind: 'skill-catalog' },
+    source: { kind: 'skill-catalog', form: 'catalog' },
     content: [{ type: 'text', text: '<system-reminder>Available skills: dsh-code-review</system-reminder>' }],
   }
   const humanMsg = user('hu-1', 'Please review runtime.ts')
@@ -1493,11 +1802,11 @@ test('prompt hierarchy lifts AGENTS.md into <user_rules>, preserves oversized to
   assert.equal(finishOf(turn1).reason.kind, 'stop')
 
   const p1 = prompts()[0]
-  const plainSystem = p1.system.replaceAll('\u200b', '')
-  assert.match(plainSystem, /<user_rules>\nMANDATORY_REPO_RULE: preserve trailing newlines\.\n<\/user_rules>/)
-  assert.match(plainSystem, /<harness_tool_contracts>[\s\S]*CRITICAL_DELEGATION_RULE: never poll in a loop after spawning\./)
-  assert.doesNotMatch(p1.text, /MANDATORY_REPO_RULE/, 'lifted initial agent-instructions are not duplicated in user input')
-  assert.equal(p1.text, 'Please review runtime.ts\n\n<system-reminder>Available skills: dsh-code-review</system-reminder>')
+  assert.equal(p1.system, '', 'default bridge has no ACP systemPrompt append')
+  assert.equal((p1.text.match(/MANDATORY_REPO_RULE/g) ?? []).length, 1, 'initial agent instructions are carried in one delimited user block')
+  assert.match(p1.text, /<dsh_system_instruction>[\s\S]*MANDATORY_REPO_RULE: preserve trailing newlines\./)
+  assert.match(p1.text, /Available skills: dsh-code-review/)
+  assert.ok(p1.text.endsWith('Please review runtime.ts'), 'the human request remains the final live input')
 
   // Turn 2: activating a deferred tool via developer `tool-addition` (in-history) keeps the exact ACP session alive!
   const devAdd = {
@@ -1674,6 +1983,15 @@ test('multi-turn tool calls mint distinct session-wide ToolCallIds so PTC subCal
   assert.equal(seenPtcSubCallIds.size, 3)
 })
 
+// 变更追溯：CHG-20261123-221500-agy-429-cooldown-b018c2a7：保留讨论错误码的正常回复。
+test('model prose discussing 429 remains a normal answer', async () => {
+  const quote = 'The example log was “⚠ API error (attempt 1): HTTP 429”. This is a quotation.'
+  const { adapter, prompts } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify([{ text: quote }]) } })
+  const step = await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'quoted429', messages: [sys, user('u1', 'explain the example')] }))
+  assert.equal(textOf(step), quote)
+  assert.equal(prompts().length, 1)
+})
+
 test('official terminal 429 in response text uses rate-limit path once', async () => {
   const warning = 'RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).'
   const { adapter, prompts } = makeRuntime({ env: { FAKE_AGY_EXTRA_MODELS: 'gemini-4-neon', FAKE_AGY_PLAN: JSON.stringify([{ chunks: ['\n\u26a0 ', warning.slice(0, 11), warning.slice(11), '\n'] }]) } })
@@ -1682,7 +2000,7 @@ test('official terminal 429 in response text uses rate-limit path once', async (
     for await (const chunk of adapter.stream({ provider: 'antigravity', model: 'gemini-4-neon', sessionId: 'text429', messages: [sys, user('u1', 'hello')] })) {
       if (chunk.type === 'text-delta') output.push(chunk.text)
     }
-  }, error => error.code === 'RATE_LIMIT' && error.message.includes(warning))
+  }, error => error.code === 'UPSTREAM_429' && error.message.includes(warning))
   assert.deepEqual(output, [])
   assert.equal(prompts().length, 1)
   assert.deepEqual(classifyAgentNotice(warning, true), { kind: 'emit' })
@@ -1692,4 +2010,27 @@ test('oversized bridge input requests DSH compaction without calling the model',
   const {adapter, prompts} = makeRuntime()
   await assert.rejects(collect(adapter.stream({provider:'antigravity',model:'gemini-4-argon',sessionId:'over-budget',messages:[sys,user('big','猫'.repeat(66000))]})), {code:'CONTEXT_WINDOW_EXCEEDED'})
   assert.equal(prompts().length,0)
+})
+
+test('dynamic tool accepts stringified object arguments and preserves schema validation', async () => {
+  const run=async(raw,sid)=>{
+    const plan=[{tool:{name:'dsh_call_tool',args:{name:'lookup',arguments:raw}}}]
+    const {adapter}=makeRuntime({config:{engineMode:'bridge'},env:{FAKE_AGY_PLAN:JSON.stringify(plan)}})
+    return await collect(adapter.stream({provider:'antigravity',model:'gemini-4-argon',sessionId:sid,tools:[lookup],messages:[sys,user('u1','test tool')]}))
+  }
+  const valid=await run('{"query":"literal","toolSummary":"meta"}','str-valid')
+  assert.deepEqual(JSON.parse(callsOf(valid)[0].arguments),{query:'literal'})
+  const invalid=await run('{"query":','str-invalid')
+  assert.equal(callsOf(invalid).length,0)
+  assert.match(textOf(invalid),/Expected a JSON object/)
+})
+
+test('history accepts formatted acknowledgments and keeps non-ACK prose out of rate classification', async () => {
+  for(const [reply,accepted] of [[' **ack.** ',true],['quota exhausted in this context',false]]) {
+    const {adapter,prompts}=makeRuntime({env:{FAKE_AGY_HANDOFF_REPLY:reply}})
+    const base={provider:'antigravity',model:'gemini-4-argon',sessionId:'S-ack',messages:[sys,user('u1','q'.repeat(BRIDGE_TEXT_BYTES-64))]}
+    if(accepted) await collect(adapter.stream(base))
+    else await assert.rejects(collect(adapter.stream(base)),e=>e.code==='TRANSPORT' && e.message.includes(reply))
+    assert.equal(prompts().length,accepted?2:1)
+  }
 })

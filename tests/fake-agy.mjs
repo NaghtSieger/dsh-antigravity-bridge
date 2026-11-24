@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+
 // Scripted stand-in for `agy acp` used by the tests. It speaks ACP v1 over
 // stdio, connects to the session's HTTP MCP server like the official agent,
 // supports `session/load` resumption across evictions/restarts, and follows
@@ -41,15 +42,15 @@
 // After a tool call the entry's `text` is emitted once the harness has
 // delivered the result; without `text` the tool result is echoed like the
 // directive modes do. A resumed turn (the harness delivered a tool result
-// inside the same prompt) continues with `afterTool`, one more part with the
-// same shape, so a test can script a degraded gate that only fires after a
-// completed tool step. A plan that runs out falls back to the directive modes.
+// inside the same prompt) continues through nested `afterTool` parts with the
+// same shape. A plan that runs out falls back to the directive modes.
 //
 // `FAKE_AGY_LIFECYCLE` names a JSONL file that records session/new,
 // session/load, and session/close, so a test can prove an ACP session stayed
 // open (no close, no replacement session) across a retried request.
 // Both modes are additive: existing directives keep their behavior, and
 // neither file nor plan is written unless its environment variable is set.
+
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
@@ -61,6 +62,7 @@ const { DatabaseSync } = req('node:sqlite')
 const log = process.env.FAKE_AGY_LOG
 const initLog = process.env.FAKE_AGY_INIT
 const mcpLog = process.env.FAKE_AGY_MCP
+const mcpResultLog = process.env.FAKE_AGY_MCP_RESULT_LOG
 const lifecycleLog = process.env.FAKE_AGY_LIFECYCLE
 /** JSONL of every `session/set_config_option` write, for tests that pin the selection handshake. */
 const configLog = process.env.FAKE_AGY_CONFIG_LOG
@@ -84,6 +86,7 @@ let pendingGatedStages = []
 /** Scripted per-`session/prompt` answers; `undefined` keeps the directive modes. */
 const planEntries = readPlan()
 let planCursor = 0
+let lastMcpToolResultText = ''
 function readPlan() {
   const raw = process.env.FAKE_AGY_PLAN
   if (raw === undefined || raw.trim().length === 0) return undefined
@@ -95,9 +98,13 @@ function readPlan() {
   }
 }
 /** Record one ACP session lifecycle event for tests that prove a session stayed open. */
-function noteLifecycle(op, sessionId, cwd) {
+function noteLifecycle(op, sessionId, cwd, params) {
   if (lifecycleLog === undefined) return
-  try { appendFileSync(lifecycleLog, `${JSON.stringify({ op, session: sessionId, ...(cwd !== undefined ? { cwd } : {}) })}\n`) } catch { /* ignore */ }
+  const wire = params === undefined ? {} : {
+    mcpServerNames: (params.mcpServers ?? []).map(server => server.name),
+    meta: params._meta,
+  }
+  try { appendFileSync(lifecycleLog, `${JSON.stringify({ op, session: sessionId, ...(cwd !== undefined ? { cwd } : {}), ...wire })}\n`) } catch { /* ignore */ }
 }
 if (persistedFile && existsSync(persistedFile)) {
   try {
@@ -111,7 +118,7 @@ function persistSessions() {
   if (!persistedFile) return
   try {
     mkdirSync(dirname(persistedFile), { recursive: true })
-    const serializable = [...sessions.values()].map(s => ({ id: s.id, model: s.model, level: s.level, cwd: s.cwd, system: s.system, genIdx: s.genIdx ?? 0 }))
+    const serializable = [...sessions.values()].map(s => ({ id: s.id, model: s.model, level: s.level, cwd: s.cwd, system: s.system, genIdx: s.genIdx ?? 0, bridgeMode: s.bridgeMode, bridgeInstructionSeen: s.bridgeInstructionSeen }))
     writeFileSync(persistedFile, JSON.stringify({ nextSession, pendingGatedStages, sessions: serializable }))
   } catch { /* ignore */ }
 }
@@ -231,6 +238,20 @@ function askPermission(s, toolCall, sessionIdOverride, optionsMode) {
 }
 
 async function runToolCall(s, name, args, opts = {}) {
+  const toolArgs = { ...args }
+  if (toolArgs.result_id === '$previous_tool_result' || toolArgs.result_id === '$previous_session_tool_result') {
+    const source = toolArgs.result_id === '$previous_tool_result' ? s.lastToolResultText ?? '' : lastMcpToolResultText
+    const notice = /tool_result_page: (\{[^\r\n]+\})/u.exec(source)
+    const page = /^result_id: ("[^\r\n]+")$/mu.exec(source)
+    const match = notice ?? page
+    if (match === null) throw new Error('Fake plan could not find the prior tool result page id.')
+    toolArgs.result_id = notice === null ? JSON.parse(match[1]) : JSON.parse(match[1]).result_id
+  }
+  if (toolArgs.offset === '$previous_page_next_offset') {
+    const match = /next_offset: (\d+)/u.exec(s.lastToolResultText ?? '')
+    if (match === null) throw new Error('Fake plan could not find the prior page cursor.')
+    toolArgs.offset = Number(match[1])
+  }
   const toolCallId = opts.reuseId ?? `tc${++toolCallSeq}`
   s.lastToolCallId = toolCallId
   const toolCall = {
@@ -238,7 +259,7 @@ async function runToolCall(s, name, args, opts = {}) {
     ...(opts.reportName !== undefined ? { name: opts.reportName } : {}),
     title: opts.title ?? `mcp_dsh_${name}`,
     kind: opts.kind ?? 'other',
-    rawInput: opts.rawInput ?? args,
+    rawInput: opts.rawInput ?? toolArgs,
   }
   const reportStructured = opts.structured === undefined ? { server: 'dsh', tool: name } : opts.structured
   if (!opts.noReport) {
@@ -267,8 +288,11 @@ async function runToolCall(s, name, args, opts = {}) {
       return `PERMISSION_${selected.startsWith('reject') ? 'REJECTED' : 'CANCELLED'}`
     }
   }
-  const res = await mcp(s.mcp, { jsonrpc: '2.0', id: ++rpcId, method: 'tools/call', params: { name, arguments: args, _meta: { progressToken: `p${rpcId}`, 'antigravity.google/conversation_id': s.id } } })
+  const res = await mcp(s.mcp, { jsonrpc: '2.0', id: ++rpcId, method: 'tools/call', params: { name, arguments: toolArgs, _meta: { progressToken: `p${rpcId}`, 'antigravity.google/conversation_id': s.id } } })
   let text = res.result.content.map(c => c.text ?? `[${c.type}]`).join('')
+  s.lastToolResultText = text
+  lastMcpToolResultText = text
+  if (mcpResultLog) appendFileSync(mcpResultLog, `${JSON.stringify({ session: s.id, name, arguments: toolArgs, isError: res.result.isError === true, content: res.result.content, text })}\n`)
   for (let hop = 0; hop < 20; hop++) {
     const match = /dsh_await_result with \{"call_id":"([^"]+)"\}/.exec(text)
     if (match === null) break
@@ -354,7 +378,8 @@ function beginPlanPart(s, part) {
  * @returns the ACP prompt result.
  */
 async function runPlanStage(s, stage) {
-  const parts = stage.tool !== undefined && stage.afterTool !== undefined ? [stage, stage.afterTool] : [stage]
+  const parts = []
+  for (let part = stage; part !== undefined; part = part.afterTool) parts.push(part)
   let text = ''
   for (const part of parts) {
     beginPlanPart(s, part)
@@ -406,6 +431,36 @@ async function runPlanStage(s, stage) {
       totalTokens: (g.inputTokens ?? 600) + (g.cachedReadTokens ?? 0) + (g.outputTokens ?? 50),
     },
   }
+}
+
+function promptHandoffKind(s, blocks) {
+  const textBlocks = blocks.filter(block => block.type === 'text')
+  const handoffBlock = textBlocks.length === 1 ? textBlocks[0] : undefined
+  if (handoffBlock?.text.startsWith('Past conversation, continued across messages.') === true) return 'history'
+  if (/^(Session context for the following request\.|Context attachment [\da-f]{16},)/.test(handoffBlock?.text ?? '')) return 'context'
+  if (s.bridgeMode && handoffBlock?.text.startsWith('Initial DSH system instructions for this session.') === true) return 'system'
+  if (s.bridgeMode && handoffBlock?.text.startsWith('Continue reading the initial DSH system instructions.') === true) return 'system'
+}
+
+function livePromptText(s, blocks, handoff) {
+  const text = []
+  const textBlocks = blocks.filter(block => block.type === 'text')
+  const handoffBlock = textBlocks.length === 1 ? textBlocks[0] : undefined
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index]
+    if (block.type !== 'text') continue
+    if (handoff !== undefined && block === handoffBlock) {
+      if (handoff === 'system') s.bridgeInstructionSeen = true
+      continue
+    }
+    if (s.bridgeMode && index === 0 && textBlocks.length > 1 && block.text.startsWith('<dsh_history>')) continue
+    if (s.bridgeMode && !s.bridgeInstructionSeen && block.text.startsWith('<dsh_system_instruction>')) {
+      s.bridgeInstructionSeen = true
+      continue
+    }
+    text.push(block.text)
+  }
+  return text.join('')
 }
 
 async function runPrompt(s, text) {
@@ -566,9 +621,9 @@ rl.on('line', async (line) => {
     if (method === 'session/new') {
       // A stuck model also opens every new session, so a request for another model must switch.
       const defaultModel = process.env.FAKE_AGY_STUCK_MODEL || (offeredModels()[0]?.value ?? 'gemini-3.8-flash')
-      const s = { id: `s${nextSession++}`, model: defaultModel, level: 'medium', cwd: params.cwd, mcp: params.mcpServers?.[0], system: params._meta?.antigravity?.systemPrompt?.append ?? '', tools: [], genIdx: 0 }
+      const s = { id: `s${nextSession++}`, model: defaultModel, level: 'medium', cwd: params.cwd, mcp: params.mcpServers?.[0], system: params._meta?.antigravity?.systemPrompt?.append ?? '', tools: [], genIdx: 0, bridgeMode: params._meta?.antigravity?.enabledTools !== undefined, bridgeInstructionSeen: false }
       sessions.set(s.id, s)
-      noteLifecycle('new', s.id, s.cwd)
+      noteLifecycle('new', s.id, s.cwd, params)
       persistSessions()
       if (s.mcp && !process.env.FAKE_AGY_NO_HANDSHAKE) {
         await mcp(s.mcp, { jsonrpc: '2.0', id: ++rpcId, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fake', version: '0' } } })
@@ -585,8 +640,9 @@ rl.on('line', async (line) => {
         return send({ jsonrpc: '2.0', id, error: { code: -32004, message: `Session "${params?.sessionId}" not found` } })
       }
       if (params.cwd !== undefined) s.cwd = params.cwd
-      noteLifecycle('load', s.id, s.cwd)
+      noteLifecycle('load', s.id, s.cwd, params)
       s.mcp = params.mcpServers?.[0]
+      s.bridgeMode = params._meta?.antigravity?.enabledTools !== undefined
       if (params._meta?.antigravity?.systemPrompt?.append !== undefined) {
         s.system = params._meta.antigravity.systemPrompt.append
       }
@@ -615,18 +671,37 @@ rl.on('line', async (line) => {
       return send({ jsonrpc: '2.0', id, result: { configOptions: configOptions(s) } })
     }
     if (method === 'session/prompt') {
-      const text = params.prompt.filter(b => b.type === 'text').map(b => b.text).join('')
-      if (log) appendFileSync(log, `${JSON.stringify({ session: s.id, cwd: s.cwd, text, images: params.prompt.filter(b => b.type === 'image').length, tools: s.tools, model: s.model, level: s.level, system: s.system })}\n`)
+      const wireText = params.prompt.filter(b => b.type === 'text').map(b => b.text).join('')
+      if (log) appendFileSync(log, `${JSON.stringify({ session: s.id, cwd: s.cwd, text: wireText, images: params.prompt.filter(b => b.type === 'image').length, tools: s.tools, model: s.model, level: s.level, system: s.system })}\n`)
+      const handoff = promptHandoffKind(s, params.prompt)
+      const text = livePromptText(s, params.prompt, handoff)
       s.cancelled = false
-      if (failMode === 'quota' && text.includes('QUOTA')) {
+      if (handoff !== undefined) {
+        update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: process.env.FAKE_AGY_HANDOFF_REPLY ?? 'ACK' } })
+      }
+      // 模拟上游已经报错、CLI 即将自动重试的间隙。
+      if (process.env.FAKE_AGY_RATE_RETRY && (text.includes('RATELIMIT') || handoff !== undefined)) {
+        noteLifecycle('upstream-attempt', s.id)
+        for (const chunk of JSON.parse(process.env.FAKE_AGY_RATE_RETRY)) {
+          update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk } })
+        }
+        await new Promise(resolve => setTimeout(resolve, 150))
+        if (!s.cancelled) noteLifecycle('upstream-attempt', s.id)
+        noteLifecycle('upstream-finished', s.id)
+        return send({ jsonrpc: '2.0', id, result: { stopReason: s.cancelled ? 'cancelled' : 'end_turn' } })
+      }
+      if (handoff === undefined && failMode === 'quota' && text.includes('QUOTA')) {
         return send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'QUOTA: Claude and GPT models weekly limit reached' } })
       }
-      if (failMode === 'ratelimit' && text.includes('RATELIMIT')) {
+      if (handoff === undefined && failMode === 'ratelimit' && text.includes('RATELIMIT')) {
         return send({ jsonrpc: '2.0', id, error: { code: -32000, message: process.env.FAKE_AGY_ERROR_MESSAGE ?? '429 Too Many Requests: model is overloaded, please retry in 2s', data: JSON.parse(process.env.FAKE_AGY_ERROR_DATA ?? 'null') } })
       }
-      const result = planEntries !== undefined && planCursor < planEntries.length
-        ? await runPlanStage(s, planEntries[planCursor++])
-        : await runPrompt(s, text)
+      const result = handoff !== undefined
+        ? { stopReason: 'end_turn', usage: { inputTokens: 50, outputTokens: 1, totalTokens: 51 } }
+        : planEntries !== undefined && planCursor < planEntries.length
+          ? await runPlanStage(s, planEntries[planCursor++])
+          : await runPrompt(s, text)
+      persistSessions()
       // `FAKE_AGY_DRIFT_LEVEL` moves the thinking level after every prompt and
       // announces it through `config_option_update`, like an agent-side reset.
       if (process.env.FAKE_AGY_DRIFT_LEVEL) {
@@ -650,5 +725,5 @@ rl.on('close', () => process.exit(0))
 process.stdin.on('end', () => process.exit(0))
 rl.on('line', (line) => {
   const msg = JSON.parse(line)
-  if (msg.method === 'session/cancel') { const s = sessions.get(msg.params.sessionId); if (s) s.cancelled = true }
+  if (msg.method === 'session/cancel') { noteLifecycle('cancel', msg.params.sessionId); const s = sessions.get(msg.params.sessionId); if (s) s.cancelled = true }
 })

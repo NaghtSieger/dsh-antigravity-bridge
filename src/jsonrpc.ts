@@ -19,6 +19,8 @@ export interface JsonRpcErrorObject {
 /** A request the remote peer answered with a JSON-RPC error. */
 export class JsonRpcRemoteError extends Error {
   override readonly name = 'JsonRpcRemoteError'
+  // 保留协议中的 HTTP 状态，供宿主停止重试。
+  readonly httpStatus?: number
   /**
    * @param method - request method the remote rejected.
    * @param rpc - the remote error object.
@@ -26,6 +28,8 @@ export class JsonRpcRemoteError extends Error {
   constructor(readonly method: string, readonly rpc: JsonRpcErrorObject) {
     const details = upstreamDetails(rpc.data)
     super(`${method}: ${rpc.message}${details.length === 0 ? '' : ` [upstream ${JSON.stringify(details)}]`}`)
+    const data = rpc.data as { status?: unknown; statusCode?: unknown; error?: { code?: unknown } } | undefined
+    if ([rpc.code, data?.status, data?.statusCode, data?.error?.code].some(value => value === 429 || value === '429')) this.httpStatus = 429
   }
 }
 
@@ -36,8 +40,9 @@ function upstreamDetails(data: unknown): Record<string, string | number>[] {
   const fields: Record<string, string | number> = {}
   const nested: Record<string, string | number>[] = []
   for (const [key, value] of Object.entries(data)) {
-    if (['reason', 'domain', 'message', 'description', 'requestId', 'request_id', 'traceId', 'trace_id', 'x-request-id', 'x-goog-request-id', 'traceparent', 'retryDelay', 'resetTime'].includes(key)
-        && (typeof value === 'string' || typeof value === 'number')) fields[key] = value
+    if (['reason', 'domain', 'message', 'description', 'requestId', 'request_id', 'traceId', 'trace_id', 'x-request-id', 'x-goog-request-id', 'traceparent', 'retryDelay', 'resetTime'].includes(key) || key.toLowerCase() === 'retry-after') {
+      if (typeof value === 'string' || typeof value === 'number') fields[key] = value
+    }
     if (['error', 'details', 'metadata', 'violations', 'headers'].includes(key)) nested.push(...upstreamDetails(value))
   }
   return [...Object.keys(fields).length === 0 ? [] : [fields], ...nested]

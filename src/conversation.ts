@@ -25,6 +25,10 @@ export { CALL_TOOL_NAME }
 
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
 const AGENT_RETRY_NOTICE = /^\s*⚠\s*(?:Error:\s*)?API error \(attempt \d+\)/i
+// 识别上游返回的限流通知，结束当前请求。
+export function reportsUpstream429(message: string): boolean {
+  return /(?:^|[\s:(])429\b|\b(?:http|status|code)[_=:]\s*429\b|\b(?:RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|too many requests)\b/i.test(message)
+}
 /** Prefix of `AGENT_RETRY_NOTICE` while its opening words arrive across chunks. */
 const AGENT_RETRY_PREFIX = /^\s*⚠\s*(?:e(?:r(?:r(?:o(?:r:?)?)?)?)?\s*)?(?:a(?:p(?:i(?:\s+e(?:r(?:r(?:o(?:r(?:\s*\((?:a(?:t(?:t(?:e(?:m(?:p(?:t(?:\s*\d*)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/i
 /** Lone warning prefix (`⚠` or `⚠ Error:`) before the notice body arrives. */
@@ -46,6 +50,7 @@ export type AgentNoticeVerdict =
   | { kind: 'emit' }
   | { kind: 'hold' }
   | { kind: 'drop' }
+  | { kind: 'rate-retry'; message: string }
   | { kind: 'error'; code: 'TRANSPORT' | 'RATE_LIMIT'; message: string }
 
 /** Collapse agy's warning mark and line breaks so the notice can be recognized across chunks. */
@@ -106,7 +111,12 @@ export function classifyAgentNotice(raw: string, final = false): AgentNoticeVerd
   const outputLimit = classifyOutputLimitNotice(raw)
   if (outputLimit === 'drop') return { kind: 'drop' }
   if (outputLimit === 'hold') return final ? { kind: 'emit' } : { kind: 'hold' }
-  if (AGENT_RETRY_NOTICE.test(raw)) return { kind: 'drop' }
+  if (AGENT_RETRY_NOTICE.test(raw)) {
+    const notice = raw.trimStart().split(/\r?\n/, 1)[0] ?? ''
+    if (reportsUpstream429(notice.replace(AGENT_RETRY_NOTICE, ''))) return { kind: 'rate-retry', message: notice }
+    if (!final && !raw.trimStart().includes('\n') && !/\b(?:EOF|ECONNRESET|ETIMEDOUT)\b/i.test(notice)) return { kind: 'hold' }
+    return { kind: 'drop' }
+  }
   if (!final && (WARNING_PREFIX.test(raw) || AGENT_RETRY_PREFIX.test(raw.trim()))) {
     return { kind: 'hold' }
   }
@@ -114,7 +124,7 @@ export function classifyAgentNotice(raw: string, final = false): AgentNoticeVerd
   if (text.length === 0) return { kind: 'emit' }
   if (raw.trimStart().startsWith('\u26a0')) {
     const expected = RESOURCE_WARNING.toLowerCase()
-    if (text === expected) return { kind: 'error', code: 'RATE_LIMIT', message: RESOURCE_WARNING }
+    if (text === expected) return { kind: 'rate-retry', message: RESOURCE_WARNING }
     if (!final && expected.startsWith(text)) return { kind: 'hold' }
   }
   const network = matchTerminalNotice(raw, text, NETWORK_ISSUE_HEAD, 'TRANSPORT', NETWORK_ISSUE_MESSAGE, final)
@@ -261,6 +271,10 @@ export class AcpTurn {
   retryNotices = 0
   /** Terminal transport or overload failure reported as message text by agy. */
   agentFailure: LlmError | undefined
+  upstreamRateLimited = false
+  cancelRateRetry?: () => void
+  onRateRetry?: (message: string) => void
+  private rateFlushPending = false
   /** Message text that may still be the start of an agy status notice. */
   private noticeHold = ''
   /** Model calls inside this turn whose usage was already emitted per-step from SQLite. */
@@ -384,6 +398,7 @@ export class AcpTurn {
    * @param update - the agent notification.
    */
   onUpdate(update: AcpSessionUpdate): void {
+    if (this.finished && !(this.rateFlushPending && update.sessionUpdate === 'agent_message_chunk')) return
     const text = update.content?.type === 'text' ? update.content.text ?? '' : ''
     if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update'
       || (update.sessionUpdate === 'plan' && Array.isArray(update.entries) && update.entries.length > 0)
@@ -427,12 +442,35 @@ export class AcpTurn {
       return
     }
     const combined = this.noticeHold + text
+    const body = combined.trimStart()
+    const newline = body.indexOf('\n')
+    if (newline >= 0 && newline + 1 < body.length && AGENT_RETRY_NOTICE.test(body)) {
+      this.noticeHold = ''
+      this.consumeMessage(body.slice(0, newline + 1))
+      if (!this.finished) this.consumeMessage(body.slice(newline + 1))
+      return
+    }
     const verdict = classifyAgentNotice(combined, false)
     if (verdict.kind === 'hold') {
       this.noticeHold = combined
       return
     }
     this.noticeHold = ''
+    if (verdict.kind === 'rate-retry') {
+      this.noticeHold = combined
+      this.upstreamRateLimited = true
+      if (!this.rateFlushPending) {
+        this.rateFlushPending = true
+        this.finished = true
+        this.cancelRateRetry?.()
+        // 立即取消。换行或 RPC 结束就交付诊断；CLI 不回执时最多给在途错误尾部 100 ms。
+        if (!body.includes('\n')) setTimeout(() => {
+          if (this.rateFlushPending) this.recoverNoticeHold()
+        }, 100).unref()
+      }
+      if (body.includes('\n')) this.recoverNoticeHold()
+      return
+    }
     if (verdict.kind === 'drop') {
       this.retryNotices++
       return
@@ -460,6 +498,12 @@ export class AcpTurn {
     const held = this.noticeHold
     this.noticeHold = ''
     const verdict = classifyAgentNotice(held, true)
+    if (verdict.kind === 'rate-retry') {
+      this.rateFlushPending = false
+      this.agentFailure = new LlmError(labeled('RATE_LIMIT', verdict.message), 'RATE_LIMIT')
+      this.onRateRetry?.(verdict.message)
+      return ''
+    }
     if (verdict.kind === 'drop') {
       this.retryNotices++
       return ''
@@ -794,7 +838,7 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
       case 'error':
         turn.finished = true
         yield * close()
-        throw event.error
+        throw turn.agentFailure ?? event.error
     }
   }
 }

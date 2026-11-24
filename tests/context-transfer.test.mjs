@@ -1,4 +1,5 @@
 
+
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { inputPrompt, replayPrompt, splitReplay, splitSystem } from '../lib/history.js'
@@ -60,4 +61,27 @@ test('assistant text around a historical tool call keeps its position', async ()
   const wire = text(await replayPrompt(history,[],noImage))
   const order = ['BEFORE','call1',block.type,'AFTER'].map(x=>wire.indexOf(x))
   assert.ok(order.every((x,i)=>x>=0 && (i===0 || x>order[i-1])))
+})
+
+test('large updates preserve inline order, Unicode bytes, and the live question and image', async () => {
+  const payload = '开始🟢' + '变更'.repeat(260) + '末尾'
+  const update = {role:'system',id:'late',content:[{type:'text',text:payload}]}
+  const picture = {type:'image',attachment:{attachmentId:'pixel'}}
+  const msgs = [user('a','LIVE_BEFORE'),update,{...user('b','LIVE_AFTER'),content:[{type:'text',text:'LIVE_AFTER'},picture]}]
+  const blocks = await inputPrompt(msgs,async()=>({data:'abc',mimeType:'image/png'}))
+  const {parts,final} = splitReplay(blocks,false,600)
+  assert.ok(parts.length > 1)
+  assert.ok(parts.every(p=>Buffer.byteLength(p)<=600 && !p.includes('LIVE_')))
+  const ref = /\[Insert staged context ([0-9a-f]+) here\.\]/.exec(text(final))
+  assert.ok(ref)
+  assert.ok(parts.every(p=>p.startsWith('Context attachment '+ref[1]+',')))
+  assert.equal(parts.map(p=>p.slice(p.indexOf('\n\n')+2)).join(''),blocks[2].text)
+  assert.equal(text(final).replace(ref[0],blocks[2].text),text(blocks))
+  assert.deepEqual(final.at(-1),blocks.at(-1))
+  const pre = await inputPrompt([update,user('a','LIVE')],noImage)
+  const staged = splitReplay(pre,false,600)
+  assert.equal(staged.parts.map(p=>p.slice(p.indexOf('\n\n')+2)).join(''),pre[0].text)
+  assert.equal(text(staged.final).trim(),'LIVE')
+  const oversize = await inputPrompt([update,user('a','U'.repeat(601))],noImage)
+  assert.deepEqual(splitReplay(oversize,false,600),{parts:[],final:oversize})
 })

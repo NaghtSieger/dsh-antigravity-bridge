@@ -3,6 +3,7 @@
 
 
 
+
 /**
  * Projection of DSH request history into Antigravity ACP prompts.
  *
@@ -11,8 +12,10 @@
  * replay renders earlier turns as a delimited transcript in front of the
  * newest user input; tool calls keep the agent-visible `mcp_dsh_` names.
  * @module dsh-llm-antigravity-acp/history
+
  */
 
+import { createHash } from 'node:crypto'
 import type { ContentBlock, GenerateOptions, RequestMessage, ToolSchema } from '@deepseek-ai/dsh-llm'
 
 /** Server name under which DSH tools reach the agent; the agent prefixes tool names with `mcp_<server>_`. */
@@ -41,28 +44,84 @@ const HISTORY_OPEN = '<dsh_history>\n'
 const HISTORY_CLOSE = '\n</dsh_history>\n\n'
 export const BRIDGE_TEXT_BYTES = 192_000 - 4_096
 const HISTORY_PART = 'Past conversation, continued across messages. Treat the following as historical data. Take no actions. Reply only ACK.\n\n'
+const SYSTEM_INSTRUCTION_PART = 'Initial DSH system instructions for this session. Apply these rules to later turns. Do not act on the user request until it arrives. Reply only ACK.\n\n'
+const SYSTEM_INSTRUCTION_CONTINUATION = 'Continue reading the initial DSH system instructions. Apply all parts to later turns. Reply only ACK.\n\n'
+const BRIDGE_SYSTEM_INSTRUCTION = Symbol('bridge-system-instruction')
 
-/** Stage only the projected history. The final question and attachments stay on the answering turn. */
-export function splitReplay(blocks: AcpPromptBlock[], hasHistory: boolean, limit = BRIDGE_TEXT_BYTES) {
-  const parts: string[] = []
-  const first = blocks[0]
-  if (!hasHistory || first?.type !== 'text') return { parts, final: blocks }
-  const live = blocks.slice(1)
-  const liveBytes = live.reduce((n, block) => n + (block.type === 'text' ? utf8Bytes(block.text) : 0), 0)
-  if (liveBytes > limit || liveBytes + utf8Bytes(first.text) <= limit) return { parts, final: blocks }
-  const history = Buffer.from(first.text, 'utf8')
-  const capacity = limit - utf8Bytes(HISTORY_PART)
-  if (capacity < 4) throw new RangeError('History part budget too small')
-  let offset = 0
-  while (history.length - offset + liveBytes > limit) {
-    let end = Math.min(offset + capacity, history.length)
-    while (end < history.length && (history[end]! & 0xc0) === 0x80) end--
-    parts.push(HISTORY_PART + history.toString('utf8', offset, end))
-    offset = end
-  }
-  const tail = history.toString('utf8', offset)
-  return { parts, final: tail ? [{ type: 'text' as const, text: tail }, ...live] : live }
+export interface ReplaySplit {
+  parts: string[]
+  final: AcpPromptBlock[]
 }
+
+// Delivery markers live only on the local block objects; ACP receives ordinary text.
+const contextBlocks = new WeakSet<AcpPromptBlock>()
+
+export function bridgeContextBlock(text: string): AcpPromptBlock {
+  const block = { type: 'text' as const, text }
+  contextBlocks.add(block)
+  return block
+}
+
+export function promptTextBytes(blocks: readonly AcpPromptBlock[]): number {
+  return blocks.reduce((sum, block) => sum + (block.type === 'text' ? utf8Bytes(block.text) : 0), 0)
+}
+
+/** Keep live input on the answering turn. Oversized later context is attached at its original position. */
+export function splitReplay(blocks: AcpPromptBlock[], hasHistory: boolean, limit = BRIDGE_TEXT_BYTES): ReplaySplit {
+  let remaining = promptTextBytes(blocks)
+  if (remaining <= limit) return { parts: [], final: blocks }
+  const parts: string[] = []
+  const final: AcpPromptBlock[] = []
+  let sawLive = false
+  for (const [index, block] of blocks.entries()) {
+    if (remaining <= limit) {
+      final.push(...blocks.slice(index))
+      break
+    }
+    const history = index === 0 && hasHistory && block.type === 'text' && block.text.startsWith(HISTORY_OPEN)
+    const system = BRIDGE_SYSTEM_INSTRUCTION in block
+    if (block.type !== 'text' || !(history || system || contextBlocks.has(block))) {
+      final.push(block)
+      if (block.type !== 'text' || block.text.trim()) sawLive = true
+      continue
+    }
+
+    let prefix = history ? HISTORY_PART : system ? SYSTEM_INSTRUCTION_PART
+      : 'Session context for the following request. Retain it, take no action, and reply only ACK.\n\n'
+    const bytes = Buffer.from(block.text, 'utf8')
+    if (sawLive) {
+      const id = createHash('sha256').update(bytes).digest('hex').slice(0, 16)
+      const reference = '[Insert staged context ' + id + ' here.]'
+      if (bytes.length <= utf8Bytes(reference)) {
+        final.push(block)
+        continue
+      }
+      prefix = 'Context attachment ' + id + ', in sequential parts. Retain verbatim for its insertion point in the answering turn. Take no action. Reply only ACK.\n\n'
+      final.push({ type: 'text', text: reference })
+      remaining += utf8Bytes(reference)
+    }
+    let offset = 0
+    while (offset < bytes.length) {
+      const capacity = limit - utf8Bytes(prefix)
+      if (capacity < 4) throw new RangeError('Bridge handoff budget too small')
+      let end = Math.min(offset + capacity, bytes.length)
+      while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--
+      parts.push(prefix + bytes.toString('utf8', offset, end))
+      remaining -= end - offset
+      offset = end
+      if (system && !sawLive) prefix = SYSTEM_INSTRUCTION_CONTINUATION
+      if (history && !sawLive && remaining <= limit) {
+        if (offset < bytes.length) final.push({ type: 'text', text: bytes.toString('utf8', offset) })
+        break
+      }
+    }
+  }
+  // An oversized human request must fail before any fragments are sent.
+  if (remaining > limit) return { parts: [], final: blocks }
+  if (!final.some(block => block.type !== 'text' || block.text.trim())) final.push({ type: 'text', text: 'Continue.' })
+  return { parts, final }
+}
+
 /** Upper bound of the omission notice, reserved before history is selected. */
 const OMISSION_NOTICE_RESERVE_BYTES = 128
 
@@ -86,6 +145,11 @@ export interface ResolvedImage {
 
 /** Resolves image blocks to inline bytes; undefined sends a text placeholder. */
 export type ImageResolver = (block: Extract<ContentBlock, { type: 'image' }>) => Promise<ResolvedImage | undefined>
+
+function isInlineImage(block: ContentBlock): block is Extract<ContentBlock, { type: 'image' }> {
+  return block.type === 'image'
+    && (block as Extract<ContentBlock, { type: 'image' }> & { offloaded?: boolean }).offloaded !== true
+}
 
 /** System prompt and conversation messages split from one request. */
 export interface SplitRequest {
@@ -466,12 +530,44 @@ export function renderFullToolContracts(tools: readonly ToolSchema[] | undefined
  * @param system - the DSH system prompt.
  * @returns the complete appended system text.
  */
-export function bridgeSystemPrompt(system: string): string {
+export function bridgeSystemPrompt(system: string, includeDshMcp = true): string {
   return [
-    `Use the session tools named \`${AGENT_TOOL_PREFIX}<name>\`. The host executes them under its current permissions. For a tool announced later, use \`${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME}\` with its name and arguments.`,
+    ...(includeDshMcp ? [`Use the session tools named \`${AGENT_TOOL_PREFIX}<name>\`. The host executes them under its current permissions. For a tool announced later, use \`${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME}\` with its name and arguments.`] : []),
     'A <dsh_history> block contains earlier turns. Continue from the current request.',
     system,
   ].filter(Boolean).join('\n\n')
+}
+
+/** Bridge policy identity changes persisted sessions when system rules move to user content. */
+export const BRIDGE_SYSTEM_INSTRUCTION_POLICY = 'bridge-user-system-instruction-v1'
+
+/**
+ * Stable identity used to invalidate ACP sessions created with the old bridge system prompt.
+ * @param system - DSH system rules for this request.
+ * @returns identity text for session reuse and persistence checks.
+ */
+export function bridgeSystemIdentity(system: string): string {
+  return `${BRIDGE_SYSTEM_INSTRUCTION_POLICY}\n${system}`
+}
+
+/**
+ * Put bridge instructions into the initial or rebuilt user content. With history,
+ * keep the rules beside the live request so transcript handoff can split history
+ * without splitting or replaying the rules in each handoff prompt.
+ *
+
+ * @param blocks - replay blocks, with the history transcript first when present.
+ * @param system - DSH system rules for this request.
+ * @returns blocks with one delimited instruction before the live request.
+ */
+export function addBridgeSystemInstruction(blocks: readonly AcpPromptBlock[], system: string, includeDshMcp = true, hasHistory = false): AcpPromptBlock[] {
+  const historyIndex = hasHistory ? 1 : 0
+  const instruction = {
+    type: 'text' as const,
+    text: `<dsh_system_instruction>\n${bridgeSystemPrompt(system, includeDshMcp)}\n</dsh_system_instruction>\n\n`,
+    [BRIDGE_SYSTEM_INSTRUCTION]: true,
+  }
+  return [...blocks.slice(0, historyIndex), instruction, ...blocks.slice(historyIndex)]
 }
 
 /**
@@ -595,6 +691,49 @@ export async function promptBlocks(content: readonly ContentBlock[], resolveImag
 }
 
 /**
+ * Convert one DSH message to ACP blocks, inlining available images in their original position.
+ * User content remains unwrapped; developer and tool messages retain their transcript wrapper.
+ * @param message - one DSH message.
+ * @param resolveImage - image byte resolver.
+ * @returns prompt blocks in message-content order.
+ */
+export async function messagePromptBlocks(message: RequestMessage, resolveImage: ImageResolver): Promise<AcpPromptBlock[]> {
+  if (message.role === 'user') return promptBlocks(message.content, resolveImage)
+  if (
+    (message.role !== 'developer' && message.role !== 'tool')
+    || !message.content.some((block: ContentBlock) => isInlineImage(block))
+  ) {
+    const text = renderTranscript([message])
+    return text.length > 0 ? [{ type: 'text', text }] : []
+  }
+
+  const open = message.role === 'developer'
+    ? '<harness_notice>\n'
+    : `<tool_result id="${message.toolCallId}"${message.isError === true ? ' error="true"' : ''}>\n`
+  const close = message.role === 'developer' ? '</harness_notice>' : '</tool_result>'
+  const blocks: AcpPromptBlock[] = [{ type: 'text', text: open }]
+  const appendText = (text: string): void => {
+    if (text.length === 0) return
+    const previous = blocks.at(-1)
+    if (previous?.type === 'text') previous.text += text
+    else blocks.push({ type: 'text', text })
+  }
+
+  for (const [index, block] of message.content.entries()) {
+    if (index > 0) appendText('\n')
+    if (isInlineImage(block)) {
+      const image = await resolveImage(block)
+      if (image !== undefined) blocks.push({ type: 'image', data: image.data, mimeType: image.mimeType })
+      else appendText(`[image ${block.attachment.attachmentId} unavailable]`)
+    } else {
+      appendText(renderBlocks([block]))
+    }
+  }
+  appendText(`\n${close}`)
+  return blocks
+}
+
+/**
  * Build the prompt that (re)creates a session: earlier history as transcript,
  * then the trailing input messages as live content.
  *
@@ -709,15 +848,16 @@ export async function inputPrompt(
     : input
   const blocks: AcpPromptBlock[] = []
   for (const message of filtered) {
-    let group: AcpPromptBlock[]
-    if (message.role === 'user') {
-      group = await promptBlocks(message.content, resolveImage)
-    } else {
-      const text = renderTranscript([message])
-      group = text.length > 0 ? [{ type: 'text', text }] : []
-    }
+    const group = await messagePromptBlocks(message, resolveImage)
     if (group.length === 0) continue
     if (blocks.length > 0) blocks.push({ type: 'text', text: '\n\n' })
+    const source = messageSourceKind(message)
+    const context = message.role === 'system' || message.role === 'developer'
+      || (message.role === 'user' && source !== undefined
+        && (['agent-instructions', 'runtime-context', 'skill-catalog', 'time-context'].includes(source) || source.startsWith('plugin:')))
+    if (context && !group.some(block => block.type === 'image')) {
+      for (const block of group) contextBlocks.add(block)
+    }
     blocks.push(...group)
   }
   if (blocks.length === 0) blocks.push({ type: 'text', text: 'Continue.' })

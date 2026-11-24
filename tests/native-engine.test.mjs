@@ -1,4 +1,5 @@
 // Contract and end-to-end tests for Native Agent Engine Mode (`engineMode: 'bridge' | 'native'`).
+
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -426,6 +427,10 @@ test('native mode omits --agent, binds canonical session/front cwd, strips DSH s
   assert.match(p1.system.replaceAll('\u200b', ''), /<user_rules>\nWORKSPACE_RULE: keep responses concise\.\n<\/user_rules>/)
   assert.match(p1.system, /<mcp_tool_contracts>[\s\S]*NEVER_POLL_SUBAGENT[\s\S]*<\/mcp_tool_contracts>/)
   assert.equal(p1.text, 'Read sample.txt, update todo_write, and summarize.')
+  const nativeWire = lifecycle().find(event => event.op === 'new')
+  assert.deepEqual(nativeWire.mcpServerNames, ['dsh'])
+  assert.equal(nativeWire.meta.antigravity.systemPrompt.append, p1.system)
+  assert.equal('enabledTools' in nativeWire.meta.antigravity, false, 'explicit native mode keeps its existing metadata')
 
   // Turn 1, Step 2: deliver todo_write result -> completes Turn 1 in the same prompt.
   const afterToolMsgs = [
@@ -457,6 +462,35 @@ test('native mode omits --agent, binds canonical session/front cwd, strips DSH s
   assert.doesNotMatch(prompts()[1].text, /<dsh_history>/, 'Turn 2 sent incremental input with rebuild: false')
   assert.equal(prompts()[1].text, 'What file did you just summarize?')
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
+})
+
+test('default bridge sends DSH rules once in initial user content and keeps warm turns incremental', async () => {
+  const { adapter, prompts, lifecycle, argvs } = makeRuntime()
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S-bridge-rules', tools: [schema('todo_write')] }
+  const firstMessages = [
+    dshSysMsg('system-1'),
+    agentsMdMsg('instructions-1', 'BRIDGE_AGENT_RULE: keep the original DSH approvals.'),
+    user('user-1', 'Initial bridge request.'),
+  ]
+  const first = await collect(adapter.stream({ ...base, messages: firstMessages }))
+  const initial = prompts()[0]
+  assert.equal(initial.system, '', 'the bridge does not set a custom ACP systemPrompt')
+  assert.equal((initial.text.match(/<dsh_system_instruction>/g) ?? []).length, 1)
+  assert.match(initial.text, /Use bash and read\./)
+  assert.match(initial.text, /BRIDGE_AGENT_RULE: keep the original DSH approvals\./)
+  assert.ok(initial.text.endsWith('Initial bridge request.'))
+  assert.equal(argvs()[0][argvs()[0].indexOf('--agent') + 1], 'dsh-bridge-scoped')
+  const wire = lifecycle().find(event => event.op === 'new')
+  assert.deepEqual(wire.mcpServerNames, ['dsh'])
+  assert.deepEqual(wire.meta.antigravity, { enabledTools: [], eagerMcpServers: ['dsh'] })
+
+  const secondMessages = [...firstMessages, assistantFrom('assistant-1', first), user('user-2', 'Warm bridge follow-up.')]
+  await collect(adapter.stream({ ...base, messages: secondMessages }))
+  const warm = prompts()[1]
+  assert.equal(warm.session, initial.session)
+  assert.equal(warm.text, 'Warm bridge follow-up.')
+  assert.doesNotMatch(warm.text, /dsh_system_instruction|BRIDGE_AGENT_RULE/)
+  assert.equal(prompts().length, 2, 'ordinary warm turns add no system handoff prompt')
 })
 
 test('native mode enforces read-only, workspace-write (paths, relative traversal, /var <-> /private/var symlinks, escaping symlinks), and danger-full-access permissions', async () => {
@@ -579,7 +613,7 @@ test('native mode enforces read-only, workspace-write (paths, relative traversal
 test('live configure({ engineMode }) and idle native frontCwd changes restart ACP slots cleanly without disrupting concurrent sessions', async () => {
   const projectDir = makeTempDir('agy-switch-proj-')
   const canonicalDir1 = realpathSync(projectDir)
-  const { adapter, runtime, argvs, procCwds, prompts } = makeRuntime({ config: { engineMode: 'bridge' } })
+  const { adapter, runtime, argvs, procCwds, prompts, lifecycle } = makeRuntime({ config: { engineMode: 'bridge' } })
 
   const req = (id, text, sessionId = 'S-live-switch', cwd = projectDir) => ({
     provider: 'antigravity',
@@ -593,13 +627,17 @@ test('live configure({ engineMode }) and idle native frontCwd changes restart AC
     ],
   })
 
-  // 1. Starts in bridge mode with `--agent dsh-bridge` and isolated workspace cwd.
+  // 1. Starts bridge mode with the dedicated scoped-tools agent and isolated workspace cwd.
   await collect(adapter.stream(req('u1', 'hello bridge')))
   assert.equal(argvs().length, 1)
-  assert.equal(argvs()[0].includes('--agent'), true)
-  assert.equal(argvs()[0][argvs()[0].indexOf('--agent') + 1], 'dsh-bridge')
+  assert.equal(argvs()[0][argvs()[0].indexOf('--agent') + 1], 'dsh-bridge-scoped')
   assert.notEqual(prompts()[0].cwd, canonicalDir1)
-  assert.deepEqual(prompts()[0].tools, ['read', 'todo_write', 'dsh_await_result', 'dsh_call_tool'])
+  assert.deepEqual(prompts()[0].tools, ['read', 'todo_write', 'dsh_await_result', 'dsh_call_tool', 'dsh_read_tool_result'])
+  assert.equal(prompts()[0].system, '', 'bridge omits the ACP systemPrompt metadata')
+  const bridgeWire = lifecycle().find(event => event.op === 'new')
+  assert.deepEqual(bridgeWire.mcpServerNames, ['dsh'])
+  assert.deepEqual(bridgeWire.meta.antigravity, { enabledTools: [], eagerMcpServers: ['dsh'] })
+  assert.match(prompts()[0].text, /<dsh_system_instruction>/)
 
   // 2. Live switch to native mode stops the bridge AcpProcess cleanly without setting an error,
   //    and the next turn spawns `agy acp` without `--agent` directly inside canonicalDir1.
@@ -632,13 +670,15 @@ test('live configure({ engineMode }) and idle native frontCwd changes restart AC
   assert.equal(prompts()[3].cwd, canonicalDir3)
   assert.ok(prompts()[3].system.includes(canonicalDir3))
 
-  // 5. Switching back to bridge mode restarts with `--agent dsh-bridge`.
+  // 5. Switching back to bridge mode restarts with the scoped-tools agent.
   const statusBridge = runtime.configure({ engineMode: 'bridge' })
   assert.equal(statusBridge.engineMode, 'bridge')
   assert.equal(statusBridge.error, undefined)
   await collect(adapter.stream(req('u4', 'back to bridge')))
   assert.equal(argvs().length, 4)
-  assert.equal(argvs()[3].includes('--agent'), true)
+  assert.equal(argvs()[3][argvs()[3].indexOf('--agent') + 1], 'dsh-bridge-scoped')
+  const bridgeWireAgain = lifecycle().filter(event => event.op === 'new').at(-1)
+  assert.deepEqual(bridgeWireAgain.meta.antigravity, { enabledTools: [], eagerMcpServers: ['dsh'] })
 })
 
 test('session-index.json resumes native sessions in effectiveCwd via session/load and invalidates on engineMode or cwd change', async () => {
